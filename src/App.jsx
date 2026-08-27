@@ -111,6 +111,15 @@ async function supabaseRest(path, { method = "GET", token, body, extraHeaders = 
   return text ? JSON.parse(text) : null;
 }
 
+async function fetchHasOnboarded(token, userId) {
+  const rows = await supabaseRest(`profiles?id=eq.${userId}&select=has_onboarded`, { token });
+  return rows?.[0]?.has_onboarded ?? false;
+}
+
+async function markOnboarded(token, userId) {
+  await supabaseRest(`profiles?id=eq.${userId}`, { method: "PATCH", token, body: { has_onboarded: true } });
+}
+
 const C = {
   bg: "#07070F",
   bgRaised: "#0F0F1A",
@@ -1717,6 +1726,34 @@ function BuilderTab({ buildList, setBuildList, burnoutList, setBurnoutList, conf
           ))}
         </div>
 
+        <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, letterSpacing: "0.08em", marginBottom: 10 }}>
+          ROTATION ORDER
+        </div>
+        <div style={{ display: "flex", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
+          {["Exercise-First", "Circuit"].map((m) => (
+            <Chip key={m} label={m === "Exercise-First" ? "Complete Each Exercise" : "Rotate Through Circuit"} active={(config.rotationMode || "Exercise-First") === m} onClick={() => setConfig((c) => ({ ...c, rotationMode: m }))} color="#8B5CF6" />
+          ))}
+        </div>
+        <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, marginBottom: 16, lineHeight: 1.5 }}>
+          {(config.rotationMode || "Exercise-First") === "Circuit"
+            ? "A → B → C → D → E once (one round), round break, repeat — like moving through CrossFit stations."
+            : "Finish all rounds of A, then move to B, then C — the classic straight-sets order."}
+        </div>
+
+        {(config.rotationMode || "Exercise-First") === "Circuit" && (
+          <div style={{ marginBottom: 16 }}>
+            <div className="fg-mono" style={{ color: C.textLo, fontSize: 10, marginBottom: 6 }}>Transition Between Stations</div>
+            <DialInput
+              value={Number(config.circuitTransition) || 10}
+              onChange={(v) => setConfig((c) => ({ ...c, circuitTransition: v }))}
+              min={0}
+              max={60}
+              step={1}
+              unit="s"
+            />
+          </div>
+        )}
+
         {config.mode === "Timer" && (
           <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
             {[
@@ -2002,10 +2039,11 @@ function LibraryBuilderScreen({ onBack, onStartWorkout, initialSession, onSaveTe
   const [tab, setTab] = useState("Library");
   const [buildList, setBuildList] = useState(() => initialSession?.buildList || []);
   const [burnoutList, setBurnoutList] = useState(() => initialSession?.burnoutList || []);
-  const [config, setConfig] = useState(() => initialSession?.config || { mode: "Timer", work: 40, rest: 20, rounds: 3, targetReps: 12 });
+  const [config, setConfig] = useState(() => initialSession?.config || { mode: "Timer", work: 40, rest: 20, rounds: 3, targetReps: 12, rotationMode: "Exercise-First", circuitTransition: 10 });
   const [savedToast, setSavedToast] = useState(false);
   const [namingTemplate, setNamingTemplate] = useState(false);
   const [templateName, setTemplateName] = useState("");
+  const [previewing, setPreviewing] = useState(false);
 
   const addToBuild = (ex) =>
     setBuildList((l) => {
@@ -2034,6 +2072,18 @@ function LibraryBuilderScreen({ onBack, onStartWorkout, initialSession, onSaveTe
     setSavedToast(true);
     setTimeout(() => setSavedToast(false), 1800);
   };
+
+  if (previewing) {
+    return (
+      <WorkoutPreviewScreen
+        buildList={buildList}
+        burnoutList={burnoutList}
+        config={config}
+        onBack={() => setPreviewing(false)}
+        onConfirm={() => onStartWorkout({ buildList, burnoutList, config })}
+      />
+    );
+  }
 
   return (
     <div style={{ minHeight: "100vh", background: C.bg }}>
@@ -2179,7 +2229,7 @@ function LibraryBuilderScreen({ onBack, onStartWorkout, initialSession, onSaveTe
       {buildList.length > 0 && !savedToast && (
         <div style={{ position: "fixed", bottom: 0, left: 0, right: 0, padding: 16, background: `linear-gradient(0deg, ${C.bg} 60%, transparent)` }}>
           <button
-            onClick={() => onStartWorkout({ buildList, burnoutList, config })}
+            onClick={() => setPreviewing(true)}
             className="fg-display"
             style={{
               width: "100%",
@@ -2238,45 +2288,82 @@ function buildTimeline(buildList, burnoutList, config) {
   const rounds = Math.max(1, parseInt(config.rounds) || 1);
   const restDur = Math.max(0, parseInt(config.rest) || 20);
   const workDur = Math.max(1, parseInt(config.work) || 40);
+  const circuitTransitionDur = Math.max(0, parseInt(config.circuitTransition) || 10);
   const segments = groupSegments(buildList);
   const phases = [];
 
-  segments.forEach((seg, segIdx) => {
-    const segAllSequence = seg.every((item) => effectiveMode(item, config) === "Sequence");
-    const transitionDur = Number(seg[0]?.supersetTransition) || 5;
+  const workPhaseFor = (item, seg, r) => {
+    const mode = effectiveMode(item, config);
+    return {
+      kind: "work",
+      mode,
+      exercise: item,
+      exercises: seg,
+      round: r,
+      totalRounds: rounds,
+      duration: mode === "Timer" ? Number(item.customWork) || workDur : null,
+      stage: "main",
+    };
+  };
 
+  if (config.rotationMode === "Circuit") {
+    // A, B, C, D, E (one round) → round break → repeat.
+    // Short transition between stations within a round; the configured
+    // Rest is used as the longer break between full rounds.
     for (let r = 1; r <= rounds; r++) {
-      seg.forEach((item, itemIdx) => {
-        const mode = effectiveMode(item, config);
-        phases.push({
-          kind: "work",
-          mode,
-          exercise: item,
-          exercises: seg,
-          round: r,
-          totalRounds: rounds,
-          duration: mode === "Timer" ? Number(item.customWork) || workDur : null,
-          stage: "main",
+      segments.forEach((seg, segIdx) => {
+        const transitionDur = Number(seg[0]?.supersetTransition) || 5;
+        seg.forEach((item, itemIdx) => {
+          phases.push(workPhaseFor(item, seg, r));
+          if (itemIdx < seg.length - 1) {
+            phases.push({ kind: "transition", duration: transitionDur, exercises: seg, next: [seg[itemIdx + 1]], stage: "main" });
+          }
         });
-        if (itemIdx < seg.length - 1) {
-          phases.push({ kind: "transition", duration: transitionDur, exercises: seg, next: [seg[itemIdx + 1]], stage: "main" });
+        const isLastSegmentInRound = segIdx === segments.length - 1;
+        const isLastPhaseOverall = r === rounds && isLastSegmentInRound;
+        if (!isLastPhaseOverall) {
+          const next = isLastSegmentInRound ? segments[0] : segments[segIdx + 1];
+          phases.push({
+            kind: isLastSegmentInRound ? "rest" : "transition",
+            duration: isLastSegmentInRound ? restDur : circuitTransitionDur,
+            exercises: seg,
+            next,
+            round: r,
+            totalRounds: rounds,
+            stage: "main",
+          });
         }
       });
-      const isLast = r === rounds && segIdx === segments.length - 1;
-      if (!isLast) {
-        const nextSeg = r < rounds ? seg : segments[segIdx + 1];
-        phases.push({
-          kind: "rest",
-          duration: segAllSequence ? null : restDur,
-          exercises: seg,
-          next: nextSeg,
-          round: r,
-          totalRounds: rounds,
-          stage: "main",
-        });
-      }
     }
-  });
+  } else {
+    // Exercise-First (default): complete all rounds of A before moving to B.
+    segments.forEach((seg, segIdx) => {
+      const segAllSequence = seg.every((item) => effectiveMode(item, config) === "Sequence");
+      const transitionDur = Number(seg[0]?.supersetTransition) || 5;
+
+      for (let r = 1; r <= rounds; r++) {
+        seg.forEach((item, itemIdx) => {
+          phases.push(workPhaseFor(item, seg, r));
+          if (itemIdx < seg.length - 1) {
+            phases.push({ kind: "transition", duration: transitionDur, exercises: seg, next: [seg[itemIdx + 1]], stage: "main" });
+          }
+        });
+        const isLast = r === rounds && segIdx === segments.length - 1;
+        if (!isLast) {
+          const nextSeg = r < rounds ? seg : segments[segIdx + 1];
+          phases.push({
+            kind: "rest",
+            duration: segAllSequence ? null : restDur,
+            exercises: seg,
+            next: nextSeg,
+            round: r,
+            totalRounds: rounds,
+            stage: "main",
+          });
+        }
+      }
+    });
+  }
 
   burnoutList.forEach((item, idx) => {
     phases.push({ kind: "work", mode: "Timer", exercise: item, exercises: [item], round: 1, totalRounds: 1, duration: 30, stage: "burnout" });
@@ -2330,6 +2417,119 @@ function MuscleFigurePlaceholder({ active, size = 140, tint, pulse }) {
 }
 
 /* ============================================================
+   WORKOUT PREVIEW — the final, customizable layout confirmation
+   before starting. Shows the real order, targets, and breaks
+   exactly as they'll run, without flattening every single round
+   into a giant repeated list.
+   ============================================================ */
+function WorkoutPreviewScreen({ buildList, burnoutList, config, onBack, onConfirm }) {
+  const segments = groupSegments(buildList);
+  const rounds = Math.max(1, parseInt(config.rounds) || 1);
+  const isCircuit = (config.rotationMode || "Exercise-First") === "Circuit";
+
+  const targetLabel = (item) => {
+    const mode = effectiveMode(item, config);
+    if (mode === "Timer") return `${Number(item.customWork) || Number(config.work) || 40}s`;
+    if (mode === "Reps") return `${item.customReps || config.targetReps || 10} reps`;
+    return "self-paced";
+  };
+
+  return (
+    <div style={{ minHeight: "100vh", background: C.bg, paddingBottom: 30 }}>
+      <FontImport />
+
+      <div style={{ padding: "22px 20px 6px", display: "flex", alignItems: "center", gap: 12 }}>
+        <button onClick={onBack} style={{ background: "none", border: "none" }}>
+          <ArrowLeft size={20} color={C.textLo} />
+        </button>
+        <h1 className="fg-display" style={{ color: C.textHi, fontSize: 24, fontWeight: 700, margin: 0 }}>
+          Workout Preview
+        </h1>
+      </div>
+
+      <div style={{ padding: "10px 20px 0" }}>
+        <div style={{ display: "flex", gap: 8, marginBottom: 18, flexWrap: "wrap" }}>
+          <Chip label={config.mode} active color={C.blue} />
+          <Chip label={isCircuit ? "Circuit" : "Exercise-First"} active color="#8B5CF6" />
+          <Chip label={`${rounds} round${rounds !== 1 ? "s" : ""}`} active color={C.amber} />
+        </div>
+
+        <div className="fg-mono" style={{ color: C.textLo, fontSize: 12, marginBottom: 20, lineHeight: 1.6 }}>
+          {isCircuit
+            ? `Go through every station below once (that's one round), rest, then repeat ${rounds} time${rounds !== 1 ? "s" : ""} total.`
+            : `Complete all ${rounds} round${rounds !== 1 ? "s" : ""} of each exercise below before moving to the next.`}
+        </div>
+
+        <div className="fg-mono" style={{ color: C.textLo, fontSize: 12, letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 10 }}>
+          {isCircuit ? "Station Order" : "Exercise Order"}
+        </div>
+
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 22 }}>
+          {segments.map((seg, i) => (
+            <div key={seg[0].uid} style={{ display: "flex", alignItems: "center", gap: 12 }}>
+              <div className="fg-mono" style={{ color: C.textLo, fontSize: 12, width: 20, flexShrink: 0 }}>{i + 1}</div>
+              <div style={{ flex: 1, background: seg.length > 1 ? "#8B5CF611" : C.bgCard, border: `1px solid ${seg.length > 1 ? "#8B5CF666" : C.line}`, borderRadius: 12, padding: "12px 14px" }}>
+                {seg.map((item, j) => (
+                  <div key={item.uid} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: j > 0 ? 6 : 0 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      {seg.length > 1 && <Link2 size={11} color="#C4B5FD" />}
+                      <span className="fg-display" style={{ color: C.textHi, fontSize: 15, fontWeight: 600 }}>{item.name}</span>
+                    </div>
+                    <span className="fg-mono" style={{ color: C.accent, fontSize: 12 }}>{targetLabel(item)}</span>
+                  </div>
+                ))}
+                {!isCircuit && (
+                  <div className="fg-mono" style={{ color: C.textLo, fontSize: 10, marginTop: 6 }}>
+                    × {rounds} round{rounds !== 1 ? "s" : ""}, {Number(config.rest) || 20}s rest between
+                  </div>
+                )}
+              </div>
+              {i < segments.length - 1 && (
+                <ArrowRight size={14} color={C.textLo} style={{ flexShrink: 0 }} />
+              )}
+            </div>
+          ))}
+        </div>
+
+        {isCircuit && (
+          <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, marginBottom: 22, lineHeight: 1.6, padding: "12px 14px", background: C.bgCard, border: `1px solid ${C.line}`, borderRadius: 10 }}>
+            {Number(config.circuitTransition) || 10}s between each station · {Number(config.rest) || 20}s round break after station {segments.length} · repeats {rounds} time{rounds !== 1 ? "s" : ""} total
+          </div>
+        )}
+
+        {burnoutList.length > 0 && (
+          <>
+            <div className="fg-mono" style={{ color: C.amber, fontSize: 12, letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 10, display: "flex", alignItems: "center", gap: 6 }}>
+              <Flame size={13} /> Then Burnout (once, max effort)
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 22 }}>
+              {burnoutList.map((item) => (
+                <div key={item.uid} style={{ background: `${C.amber}0F`, border: `1px solid ${C.amber}44`, borderRadius: 12, padding: "12px 14px" }}>
+                  <span className="fg-display" style={{ color: C.textHi, fontSize: 15, fontWeight: 600 }}>{item.name}</span>
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+
+        <button
+          onClick={onConfirm}
+          className="fg-display"
+          style={{
+            width: "100%", background: `linear-gradient(135deg, ${C.blue}, #1D4ED8)`, border: "none", borderRadius: 14,
+            padding: "17px", color: "white", fontWeight: 700, fontSize: 17,
+            display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
+            boxShadow: `0 8px 30px ${C.blue}44`,
+          }}
+        >
+          <Play size={17} fill="white" /> Start Workout
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
    ACTIVE WORKOUT SCREEN
    ============================================================ */
 function ActiveWorkoutScreen({ buildList, burnoutList, config, squadInfo, onExit, onSaveSession }) {
@@ -2344,6 +2544,7 @@ function ActiveWorkoutScreen({ buildList, burnoutList, config, squadInfo, onExit
   const [queuedBurnout, setQueuedBurnout] = useState([]);
   const [elapsed, setElapsed] = useState(0);
   const [showSquadExpand, setShowSquadExpand] = useState(false);
+  const [squadPingSent, setSquadPingSent] = useState(null);
 
   const phase = timeline[idx];
 
@@ -2724,6 +2925,7 @@ function ActiveWorkoutScreen({ buildList, burnoutList, config, squadInfo, onExit
           exercises={phase.exercise ? [phase.exercise] : phase.exercises || []}
           setNumber={phase.round}
           totalSets={phase.totalRounds}
+          squadInfo={squadInfo}
           onClose={() => setShowRestLog(false)}
           onLogSet={(entry) => setSessionLog((l) => [...l, entry])}
           onQueueBurnout={(ex) => setQueuedBurnout((q) => [...q, ex])}
@@ -2761,17 +2963,35 @@ function ActiveWorkoutScreen({ buildList, burnoutList, config, squadInfo, onExit
 
       {showSquadExpand && squadInfo && (
         <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.75)", zIndex: 90, display: "flex", flexDirection: "column" }} onClick={() => setShowSquadExpand(false)}>
-          <div onClick={(e) => e.stopPropagation()} style={{ marginTop: "auto", background: C.bgRaised, borderTop: `1px solid ${C.line}`, borderRadius: "20px 20px 0 0", padding: 22, maxHeight: "80vh", overflowY: "auto" }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 18 }}>
-              <div className="fg-display" style={{ color: C.textHi, fontSize: 20, fontWeight: 700 }}>Squad Rotation</div>
+          <div onClick={(e) => e.stopPropagation()} style={{ marginTop: "auto", background: C.bgRaised, borderTop: `1px solid ${C.line}`, borderRadius: "20px 20px 0 0", padding: 22, maxHeight: "85vh", overflowY: "auto" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+              <div className="fg-display" style={{ color: C.textHi, fontSize: 20, fontWeight: 700 }}>Squad</div>
               <button onClick={() => setShowSquadExpand(false)} style={{ background: "none", border: "none" }}>
                 <X size={20} color={C.textLo} />
               </button>
             </div>
-            <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, marginBottom: 16 }}>
-              Everyone's station in the shared rotation — not live-synced yet, but this is where it's headed.
+
+            {(() => {
+              const leaderboard = [...squadInfo.members].map((m) => ({ ...m, points: m.completedCount * 10 + m.streak * 5 })).sort((a, b) => b.points - a.points);
+              return leaderboard.some((m) => m.points > 0) ? (
+                <div style={{ display: "flex", gap: 8, marginBottom: 18, overflowX: "auto" }}>
+                  {leaderboard.slice(0, 3).map((m, i) => (
+                    <div key={m.id} style={{ flex: 1, minWidth: 95, background: C.bgCard, border: `1px solid ${i === 0 ? C.amber : C.line}`, borderRadius: 12, padding: "10px 12px", display: "flex", alignItems: "center", gap: 7 }}>
+                      {i === 0 ? <Crown size={12} color={C.amber} /> : <span className="fg-mono" style={{ color: C.textLo, fontSize: 10 }}>{i + 1}</span>}
+                      <div style={{ minWidth: 0, flex: 1 }}>
+                        <div className="fg-display" style={{ color: C.textHi, fontSize: 11, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{m.name}</div>
+                        <div className="fg-mono" style={{ color: C.accent, fontSize: 9, display: "flex", alignItems: "center", gap: 3 }}><Zap size={8} /> {m.points}</div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : null;
+            })()}
+
+            <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: 10 }}>
+              Station Rotation
             </div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 20 }}>
               {squadInfo.sequence.map((st, i) => {
                 const here = squadInfo.members.filter((m) => m.currentIndex % squadInfo.sequence.length === i);
                 return (
@@ -2789,6 +3009,31 @@ function ActiveWorkoutScreen({ buildList, burnoutList, config, squadInfo, onExit
                 );
               })}
             </div>
+
+            <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: 10, textAlign: "center" }}>
+              Quick Ping
+            </div>
+            <div style={{ display: "flex", gap: 10, justifyContent: "center" }}>
+              {["💪", "🔥", "👊", "⚡"].map((emoji) => (
+                <button
+                  key={emoji}
+                  onClick={() => { setSquadPingSent(emoji); setTimeout(() => setSquadPingSent(null), 1400); }}
+                  style={{
+                    width: 50, height: 50, borderRadius: "50%",
+                    background: squadPingSent === emoji ? `${C.blue}33` : C.bgCard,
+                    border: `1px solid ${squadPingSent === emoji ? C.blue : C.line}`,
+                    fontSize: 21, display: "flex", alignItems: "center", justifyContent: "center",
+                  }}
+                >
+                  {emoji}
+                </button>
+              ))}
+            </div>
+            {squadPingSent && (
+              <div className="fg-mono" style={{ color: C.accent, fontSize: 12, textAlign: "center", marginTop: 10 }}>
+                Sent {squadPingSent} to the squad
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -2962,7 +3207,7 @@ function DialInput({ value, onChange, min = 0, max = 999, step = 1, unit = "", p
 
 const PARTNER_PINGS = ["💪", "🔥", "👊", "⚡"];
 
-function RestLogScreen({ exercises, setNumber, totalSets, onClose, onLogSet, onQueueBurnout }) {
+function RestLogScreen({ exercises, setNumber, totalSets, squadInfo, onClose, onLogSet, onQueueBurnout }) {
   const list = exercises && exercises.length ? exercises : [{ id: "unknown", name: "Exercise", uid: "unknown" }];
   const [activeIdx, setActiveIdx] = useState(0);
   const exercise = list[activeIdx] || list[0];
@@ -2974,6 +3219,8 @@ function RestLogScreen({ exercises, setNumber, totalSets, onClose, onLogSet, onQ
   const [logged, setLogged] = useState(false);
   const [queued, setQueued] = useState(false);
   const [pingSent, setPingSent] = useState(null);
+
+  const pingTarget = squadInfo?.members?.find((m) => !m.isMe && m.online);
 
   useEffect(() => {
     setWeightType(defaultWeightType(exercise.equipment));
@@ -2992,9 +3239,10 @@ function RestLogScreen({ exercises, setNumber, totalSets, onClose, onLogSet, onQ
       loggedAt: Date.now(),
     });
     setLogged(true);
-    setReps(0);
-    setRpe(null);
-    setTimeout(() => setLogged(false), 1400);
+    // Auto-close a beat after logging — designed for sweaty hands mid-set,
+    // not for lingering on this screen. Tap the floating button again to
+    // log another exercise in a superset.
+    setTimeout(onClose, 850);
   };
 
   const handleQueue = () => {
@@ -3023,13 +3271,13 @@ function RestLogScreen({ exercises, setNumber, totalSets, onClose, onLogSet, onQ
       <FontImport />
 
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "20px 20px 4px" }}>
-        <button onClick={onClose} style={{ background: "none", border: "none" }}>
-          <X size={22} color={C.textLo} />
+        <button onClick={onClose} style={{ background: "none", border: "none", padding: 8 }}>
+          <X size={26} color={C.textLo} />
         </button>
         <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, letterSpacing: "0.1em", textTransform: "uppercase" }}>
           Log Set {setNumber ? `· Set ${setNumber}${totalSets ? ` of ${totalSets}` : ""}` : ""}
         </div>
-        <div style={{ width: 22 }} />
+        <div style={{ width: 42 }} />
       </div>
 
       <div style={{ padding: "8px 20px" }}>
@@ -3041,7 +3289,7 @@ function RestLogScreen({ exercises, setNumber, totalSets, onClose, onLogSet, onQ
           </div>
         )}
 
-        <div className="fg-display" style={{ color: C.textHi, fontSize: 24, fontWeight: 700, textAlign: "center", marginBottom: 14 }}>
+        <div className="fg-display" style={{ color: C.textHi, fontSize: 26, fontWeight: 700, textAlign: "center", marginBottom: 14 }}>
           {exercise.name}
         </div>
 
@@ -3050,29 +3298,43 @@ function RestLogScreen({ exercises, setNumber, totalSets, onClose, onLogSet, onQ
         </div>
 
         {/* log fields */}
-        <div style={{ background: C.bgCard, border: `1px solid ${C.line}`, borderRadius: 14, padding: 16, marginBottom: 16 }}>
-          <div style={{ marginBottom: 14 }}>
-            <div className="fg-mono" style={{ color: C.textLo, fontSize: 10, letterSpacing: "0.08em", marginBottom: 6 }}>REPS THIS SET</div>
+        <div style={{ background: C.bgCard, border: `1px solid ${C.line}`, borderRadius: 14, padding: 18, marginBottom: 18 }}>
+          <div style={{ marginBottom: 18 }}>
+            <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, letterSpacing: "0.08em", marginBottom: 8 }}>REPS THIS SET</div>
             <DialInput value={reps} onChange={setReps} min={0} max={100} step={1} unit="" />
           </div>
-          <div style={{ marginBottom: 4 }}>
-            <div className="fg-mono" style={{ color: C.textLo, fontSize: 10, letterSpacing: "0.08em", marginBottom: 6 }}>WEIGHT (LBS)</div>
+          <div style={{ marginBottom: 6 }}>
+            <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, letterSpacing: "0.08em", marginBottom: 8 }}>WEIGHT (LBS)</div>
             <DialInput value={weight} onChange={setWeight} min={0} max={999} step={5} unit=" lbs" />
           </div>
-          <div className="fg-mono" style={{ color: C.textLo, fontSize: 10, marginBottom: 14 }}>
+          <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, marginBottom: 18 }}>
             e.g. {reps || "10"} reps of this exercise, at {weight || "60"} lbs, for this one set.
           </div>
 
-          <div className="fg-mono" style={{ color: C.textLo, fontSize: 10, letterSpacing: "0.08em", marginBottom: 8 }}>WEIGHT TYPE</div>
-          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 18 }}>
+          <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, letterSpacing: "0.08em", marginBottom: 10 }}>WEIGHT TYPE</div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 22 }}>
             {WEIGHT_TYPES.map((w) => (
-              <Chip key={w} label={w} active={weightType === w} onClick={() => setWeightType(w)} />
+              <button
+                key={w}
+                onClick={() => setWeightType(w)}
+                className="fg-mono"
+                style={{
+                  padding: "12px 16px",
+                  borderRadius: 20,
+                  fontSize: 14,
+                  border: `1px solid ${weightType === w ? C.blue : C.line}`,
+                  background: weightType === w ? `${C.blue}22` : "transparent",
+                  color: weightType === w ? C.accent : C.textLo,
+                }}
+              >
+                {w}
+              </button>
             ))}
           </div>
 
-          <div className="fg-mono" style={{ color: C.textLo, fontSize: 10, letterSpacing: "0.08em", marginBottom: 4 }}>RPE — RATE OF PERCEIVED EXERTION</div>
-          <div className="fg-mono" style={{ color: C.textLo, fontSize: 10, marginBottom: 8 }}>How hard did this set feel? 1 = easy, 10 = max effort.</div>
-          <div style={{ display: "flex", gap: 5 }}>
+          <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, letterSpacing: "0.08em", marginBottom: 4 }}>RPE — RATE OF PERCEIVED EXERTION</div>
+          <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, marginBottom: 10 }}>How hard did this set feel? 1 = easy, 10 = max effort.</div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 8 }}>
             {Array.from({ length: 10 }).map((_, i) => {
               const v = i + 1;
               return (
@@ -3081,13 +3343,13 @@ function RestLogScreen({ exercises, setNumber, totalSets, onClose, onLogSet, onQ
                   onClick={() => setRpe(v)}
                   className="fg-mono"
                   style={{
-                    flex: 1,
-                    padding: "9px 0",
-                    borderRadius: 7,
+                    padding: "16px 0",
+                    borderRadius: 10,
                     border: `1px solid ${rpe === v ? C.blue : C.line}`,
                     background: rpe === v ? `${C.blue}33` : "transparent",
                     color: rpe === v ? C.accent : C.textLo,
-                    fontSize: 12,
+                    fontSize: 16,
+                    fontWeight: 600,
                   }}
                 >
                   {v}
@@ -3104,19 +3366,19 @@ function RestLogScreen({ exercises, setNumber, totalSets, onClose, onLogSet, onQ
             width: "100%",
             background: logged ? "#16A34A" : C.blue,
             border: "none",
-            borderRadius: 12,
-            padding: "16px",
+            borderRadius: 14,
+            padding: "22px",
             color: "white",
             fontWeight: 700,
-            fontSize: 17,
+            fontSize: 20,
             display: "flex",
             alignItems: "center",
             justifyContent: "center",
-            gap: 8,
-            marginBottom: 10,
+            gap: 10,
+            marginBottom: 12,
           }}
         >
-          {logged ? <Check size={18} /> : "◈"} {logged ? "Set Logged" : "LOG SET"}
+          {logged ? <Check size={22} /> : "◈"} {logged ? "Set Logged" : "LOG SET"}
         </button>
 
         <button
@@ -3126,11 +3388,11 @@ function RestLogScreen({ exercises, setNumber, totalSets, onClose, onLogSet, onQ
             width: "100%",
             background: queued ? `${C.amber}33` : "transparent",
             border: `1px solid ${C.amber}`,
-            borderRadius: 12,
-            padding: "14px",
+            borderRadius: 14,
+            padding: "18px",
             color: C.amber,
             fontWeight: 600,
-            fontSize: 15,
+            fontSize: 16,
             display: "flex",
             alignItems: "center",
             justifyContent: "center",
@@ -3138,33 +3400,37 @@ function RestLogScreen({ exercises, setNumber, totalSets, onClose, onLogSet, onQ
             marginBottom: 20,
           }}
         >
-          <Flame size={16} /> {queued ? "Queued to Burnout" : "Queue to Burnout"}
+          <Flame size={18} /> {queued ? "Queued to Burnout" : "Queue to Burnout"}
         </button>
 
-        <div className="fg-mono" style={{ color: C.textLo, fontSize: 10, letterSpacing: "0.08em", textAlign: "center", marginBottom: 10 }}>
-          PING JESS
-        </div>
-        <div style={{ display: "flex", gap: 10, justifyContent: "center", marginBottom: 30 }}>
-          {PARTNER_PINGS.map((emoji) => (
-            <button
-              key={emoji}
-              onClick={() => sendPing(emoji)}
-              style={{
-                width: 48, height: 48, borderRadius: "50%",
-                background: pingSent === emoji ? `${C.blue}33` : C.bgCard,
-                border: `1px solid ${pingSent === emoji ? C.blue : C.line}`,
-                fontSize: 20,
-                display: "flex", alignItems: "center", justifyContent: "center",
-              }}
-            >
-              {emoji}
-            </button>
-          ))}
-        </div>
-        {pingSent && (
-          <div className="fg-mono" style={{ color: C.accent, fontSize: 12, textAlign: "center", marginTop: -22, marginBottom: 20 }}>
-            Sent {pingSent} to Jess
-          </div>
+        {pingTarget && (
+          <>
+            <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, letterSpacing: "0.08em", textAlign: "center", marginBottom: 12 }}>
+              PING {pingTarget.name.toUpperCase()}
+            </div>
+            <div style={{ display: "flex", gap: 12, justifyContent: "center", marginBottom: 30 }}>
+              {PARTNER_PINGS.map((emoji) => (
+                <button
+                  key={emoji}
+                  onClick={() => sendPing(emoji)}
+                  style={{
+                    width: 56, height: 56, borderRadius: "50%",
+                    background: pingSent === emoji ? `${C.blue}33` : C.bgCard,
+                    border: `1px solid ${pingSent === emoji ? C.blue : C.line}`,
+                    fontSize: 24,
+                    display: "flex", alignItems: "center", justifyContent: "center",
+                  }}
+                >
+                  {emoji}
+                </button>
+              ))}
+            </div>
+            {pingSent && (
+              <div className="fg-mono" style={{ color: C.accent, fontSize: 12, textAlign: "center", marginTop: -22, marginBottom: 20 }}>
+                Sent {pingSent} to {pingTarget.name}
+              </div>
+            )}
+          </>
         )}
       </div>
     </div>
@@ -3376,28 +3642,42 @@ function FreestyleLogEntry({ exercise, setNumber, onClose, onLog }) {
           This logs one set — e.g. {reps || "10"} reps at {weight || "60"} lbs. Add another set for the next round.
         </div>
 
-        <div className="fg-mono" style={{ color: C.textLo, fontSize: 10, letterSpacing: "0.08em", marginBottom: 8 }}>WEIGHT TYPE</div>
-        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 18 }}>
+        <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, letterSpacing: "0.08em", marginBottom: 10 }}>WEIGHT TYPE</div>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 22 }}>
           {WEIGHT_TYPES.map((w) => (
-            <Chip key={w} label={w} active={weightType === w} onClick={() => setWeightType(w)} />
+            <button
+              key={w}
+              onClick={() => setWeightType(w)}
+              className="fg-mono"
+              style={{
+                padding: "12px 16px",
+                borderRadius: 20,
+                fontSize: 14,
+                border: `1px solid ${weightType === w ? C.blue : C.line}`,
+                background: weightType === w ? `${C.blue}22` : "transparent",
+                color: weightType === w ? C.accent : C.textLo,
+              }}
+            >
+              {w}
+            </button>
           ))}
         </div>
 
-        <div className="fg-mono" style={{ color: C.textLo, fontSize: 10, letterSpacing: "0.08em", marginBottom: 4 }}>RPE — RATE OF PERCEIVED EXERTION</div>
-        <div className="fg-mono" style={{ color: C.textLo, fontSize: 10, marginBottom: 8 }}>How hard did this set feel? 1 = easy, 10 = max effort.</div>
-        <div style={{ display: "flex", gap: 5, marginBottom: 20 }}>
+        <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, letterSpacing: "0.08em", marginBottom: 4 }}>RPE — RATE OF PERCEIVED EXERTION</div>
+        <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, marginBottom: 10 }}>How hard did this set feel? 1 = easy, 10 = max effort.</div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 8, marginBottom: 22 }}>
           {Array.from({ length: 10 }).map((_, i) => {
             const v = i + 1;
             return (
               <button key={v} onClick={() => setRpe(v)} className="fg-mono"
-                style={{ flex: 1, padding: "9px 0", borderRadius: 7, border: `1px solid ${rpe === v ? C.blue : C.line}`, background: rpe === v ? `${C.blue}33` : "transparent", color: rpe === v ? C.accent : C.textLo, fontSize: 12 }}>
+                style={{ padding: "16px 0", borderRadius: 10, border: `1px solid ${rpe === v ? C.blue : C.line}`, background: rpe === v ? `${C.blue}33` : "transparent", color: rpe === v ? C.accent : C.textLo, fontSize: 16, fontWeight: 600 }}>
                 {v}
               </button>
             );
           })}
         </div>
 
-        <button onClick={submit} className="fg-display" style={{ width: "100%", background: C.blue, border: "none", borderRadius: 12, padding: "16px", color: "white", fontWeight: 700, fontSize: 17 }}>
+        <button onClick={submit} className="fg-display" style={{ width: "100%", background: C.blue, border: "none", borderRadius: 14, padding: "22px", color: "white", fontWeight: 700, fontSize: 20 }}>
           ◈ Log This Set
         </button>
       </div>
@@ -3509,7 +3789,7 @@ const est1RM = (weight, reps) => (weight && reps ? weight * (1 + reps / 30) : we
 
 function useHistoryData(liveHistory) {
   return useMemo(() => {
-    const sessions = [...liveHistory, ...SEED_HISTORY].sort((a, b) => b.date - a.date);
+    const sessions = [...liveHistory].sort((a, b) => b.date - a.date);
     const allSets = [];
     sessions.forEach((s) => s.sets.forEach((set) => allSets.push({ ...set, sessionId: s.id, sessionDate: s.date, sessionMode: s.mode })));
 
@@ -3921,17 +4201,9 @@ function HistoryScreen({ liveHistory, onBack }) {
 
 /* ============================================================
    SOCIAL — Friends / Requests / Profile
+   Starts genuinely empty for a real account — friends only appear
+   once someone actually connects via a real invite (Phase 2).
    ============================================================ */
-const INITIAL_FRIENDS = [
-  { id: "f1", name: "Jess", online: true, location: "At the gym now", streak: 5 },
-  { id: "f2", name: "Marcus", online: false, location: "Last active 2h ago", streak: 2 },
-];
-
-const INITIAL_REQUESTS = [
-  { id: "r1", name: "Priya", mutual: 2 },
-  { id: "r2", name: "Devon", mutual: 0 },
-];
-
 function avatarColorFor(name) {
   const colors = [[C.blue, C.accent], ["#8B5CF6", "#C4B5FD"], [C.amber, "#FCD34D"], ["#16A34A", "#4ADE80"]];
   const idx = name.charCodeAt(0) % colors.length;
@@ -3955,26 +4227,29 @@ function Avatar({ name, size = 44 }) {
   );
 }
 
-function SocialScreen({ user, onBack, onSignOut, onStartSquad }) {
-  const [tab, setTab] = useState("Friends");
-  const [friends, setFriends] = useState(INITIAL_FRIENDS);
-  const [requests, setRequests] = useState(INITIAL_REQUESTS);
+function SocialScreen({ user, history, onBack, onSignOut, onStartSquad }) {
+  const [friends, setFriends] = useState([]);
+  const [requests, setRequests] = useState([]);
   const [copied, setCopied] = useState(false);
   const [invitedToast, setInvitedToast] = useState(null);
   const [socialHydrated, setSocialHydrated] = useState(false);
+  const [showProfile, setShowProfile] = useState(false);
   const inviteCode = useMemo(() => `FORGE-${(user?.name || "YOU").slice(0, 3).toUpperCase()}${Math.floor(1000 + Math.random() * 9000)}`, [user]);
+  const friendsKey = `social-friends:${user?.id || "anon"}`;
+  const requestsKey = `social-requests:${user?.id || "anon"}`;
 
   useEffect(() => {
     (async () => {
-      const [storedFriends, storedRequests] = await Promise.all([storageGet("social-friends"), storageGet("social-requests")]);
+      const [storedFriends, storedRequests] = await Promise.all([storageGet(friendsKey), storageGet(requestsKey)]);
       if (storedFriends) setFriends(storedFriends);
       if (storedRequests) setRequests(storedRequests);
       setSocialHydrated(true);
     })();
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.id]);
 
-  useEffect(() => { if (socialHydrated) storageSet("social-friends", friends); }, [friends, socialHydrated]);
-  useEffect(() => { if (socialHydrated) storageSet("social-requests", requests); }, [requests, socialHydrated]);
+  useEffect(() => { if (socialHydrated) storageSet(friendsKey, friends); }, [friends, socialHydrated, friendsKey]);
+  useEffect(() => { if (socialHydrated) storageSet(requestsKey, requests); }, [requests, socialHydrated, requestsKey]);
 
   const handleCopy = () => {
     const link = `https://forge.app/join/${inviteCode}`;
@@ -3997,103 +4272,120 @@ function SocialScreen({ user, onBack, onSignOut, onStartSquad }) {
     setTimeout(() => setInvitedToast(null), 1800);
   };
 
-  const tabs = ["Friends", "Requests", "Profile"];
+  // real stats, not placeholders — derived from actual History
+  const sessionCount = (history || []).length;
+  const dayKeys = new Set((history || []).map((s) => new Date(s.date).toDateString()));
+  let streak = 0;
+  for (let i = 0; i < 60; i++) {
+    const d = new Date();
+    d.setDate(d.getDate() - i);
+    if (dayKeys.has(d.toDateString())) streak++;
+    else if (i > 0) break;
+  }
 
   return (
     <div style={{ minHeight: "100vh", background: C.bg, paddingBottom: 40 }}>
       <FontImport />
 
-      <div style={{ padding: "22px 20px 10px", display: "flex", alignItems: "center", gap: 12 }}>
-        <button onClick={onBack} style={{ background: "none", border: "none" }}>
-          <ArrowLeft size={20} color={C.textLo} />
+      <div style={{ padding: "22px 20px 10px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <button onClick={onBack} style={{ background: "none", border: "none" }}>
+            <ArrowLeft size={20} color={C.textLo} />
+          </button>
+          <h1 className="fg-display" style={{ color: C.textHi, fontSize: 26, fontWeight: 700, margin: 0 }}>
+            Social
+          </h1>
+        </div>
+        <button onClick={() => setShowProfile(true)} style={{ background: "none", border: "none", padding: 0 }}>
+          <Avatar name={user?.name || "You"} size={38} />
         </button>
-        <h1 className="fg-display" style={{ color: C.textHi, fontSize: 26, fontWeight: 700, margin: 0 }}>
-          Social
-        </h1>
       </div>
 
-      <div style={{ display: "flex", gap: 8, padding: "10px 20px 0" }}>
-        {tabs.map((t) => (
-          <button
-            key={t}
-            onClick={() => setTab(t)}
-            className="fg-display"
+      <div style={{ padding: "18px 20px 0" }}>
+        <div style={{ background: C.bgCard, border: `1px solid ${C.line}`, borderRadius: 14, padding: 16, marginBottom: 18 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+            <UserPlus size={15} color={C.accent} />
+            <div className="fg-display" style={{ color: C.textHi, fontSize: 16, fontWeight: 700 }}>
+              Invite a Training Partner
+            </div>
+          </div>
+          <div
             style={{
-              flex: 1,
-              padding: "11px 0",
-              borderRadius: 10,
-              border: `1px solid ${tab === t ? C.blue : C.line}`,
-              background: tab === t ? `${C.blue}1A` : "transparent",
-              color: tab === t ? C.accent : C.textLo,
-              fontWeight: 600,
-              fontSize: 15,
-              position: "relative",
+              display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10,
+              background: C.bg, border: `1px solid ${C.line}`, borderRadius: 10, padding: "10px 12px", marginBottom: 8,
             }}
           >
-            {t}
-            {t === "Requests" && requests.length > 0 && (
-              <span
-                style={{
-                  position: "absolute", top: 4, right: 10, width: 7, height: 7,
-                  borderRadius: "50%", background: C.amber,
-                }}
-              />
-            )}
-          </button>
-        ))}
-      </div>
-
-      {/* ===== FRIENDS TAB ===== */}
-      {tab === "Friends" && (
-        <div style={{ padding: "18px 20px 0" }}>
-          <div style={{ background: C.bgCard, border: `1px solid ${C.line}`, borderRadius: 14, padding: 16, marginBottom: 22 }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
-              <UserPlus size={15} color={C.accent} />
-              <div className="fg-display" style={{ color: C.textHi, fontSize: 16, fontWeight: 700 }}>
-                Invite a Training Partner
-              </div>
-            </div>
-            <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, marginBottom: 12, lineHeight: 1.5 }}>
-              Send this link — once they sign up, they'll land on your profile and can send a friend request for you to approve.
-            </div>
-            <div
+            <span className="fg-mono" style={{ color: C.textHi, fontSize: 12, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              forge.app/join/{inviteCode}
+            </span>
+            <button
+              onClick={handleCopy}
               style={{
-                display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10,
-                background: C.bg, border: `1px solid ${C.line}`, borderRadius: 10, padding: "10px 12px",
+                background: copied ? "#16A34A" : C.blue, border: "none", borderRadius: 8, padding: "7px 12px",
+                color: "white", display: "flex", alignItems: "center", gap: 5, flexShrink: 0,
               }}
+              className="fg-mono"
             >
-              <span className="fg-mono" style={{ color: C.textHi, fontSize: 12, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                forge.app/join/{inviteCode}
-              </span>
-              <button
-                onClick={handleCopy}
-                style={{
-                  background: copied ? "#16A34A" : C.blue, border: "none", borderRadius: 8, padding: "7px 12px",
-                  color: "white", display: "flex", alignItems: "center", gap: 5, flexShrink: 0,
-                }}
-                className="fg-mono"
-              >
-                {copied ? <Check size={13} /> : <Copy size={13} />} {copied ? "Copied" : "Copy"}
-              </button>
+              {copied ? <Check size={13} /> : <Copy size={13} />} {copied ? "Copied" : "Copy"}
+            </button>
+          </div>
+          <div className="fg-mono" style={{ color: C.textLo, fontSize: 10, lineHeight: 1.4 }}>
+            Invites aren't fully live yet — connections stay on this device until real accounts can link up directly.
+          </div>
+        </div>
+
+        {requests.length > 0 && (
+          <div style={{ marginBottom: 18 }}>
+            <div className="fg-mono" style={{ color: C.amber, fontSize: 12, letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 10 }}>
+              Requests ({requests.length})
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {requests.map((r) => (
+                <div key={r.id} style={{ background: C.bgCard, border: `1px solid ${C.amber}44`, borderRadius: 12, padding: "12px 14px" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
+                    <Avatar name={r.name} size={36} />
+                    <div style={{ flex: 1 }}>
+                      <div className="fg-display" style={{ color: C.textHi, fontSize: 15, fontWeight: 600 }}>{r.name}</div>
+                      <div className="fg-mono" style={{ color: C.textLo, fontSize: 10 }}>
+                        {r.mutual > 0 ? `${r.mutual} mutual connections` : "New to FORGE"}
+                      </div>
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button onClick={() => declineRequest(r)} className="fg-display" style={{ flex: 1, background: "transparent", border: `1px solid ${C.line}`, borderRadius: 8, padding: "9px", color: C.textLo, fontWeight: 600, fontSize: 13 }}>
+                      Decline
+                    </button>
+                    <button onClick={() => acceptRequest(r)} className="fg-display" style={{ flex: 1, background: C.blue, border: "none", borderRadius: 8, padding: "9px", color: "white", fontWeight: 700, fontSize: 13 }}>
+                      Accept
+                    </button>
+                  </div>
+                </div>
+              ))}
             </div>
           </div>
+        )}
 
-          <button
-            onClick={onStartSquad}
-            className="fg-display"
-            style={{
-              width: "100%", background: `linear-gradient(135deg, ${C.blue}, #1D4ED8)`, border: "none", borderRadius: 14,
-              padding: "16px", color: "white", fontWeight: 700, fontSize: 16, marginBottom: 22,
-              display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
-              boxShadow: `0 8px 24px ${C.blue}33`,
-            }}
-          >
-            <Users size={17} /> Start Squad Session
-          </button>
+        <button
+          onClick={onStartSquad}
+          className="fg-display"
+          style={{
+            width: "100%", background: `linear-gradient(135deg, ${C.blue}, #1D4ED8)`, border: "none", borderRadius: 14,
+            padding: "16px", color: "white", fontWeight: 700, fontSize: 16, marginBottom: 22,
+            display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
+            boxShadow: `0 8px 24px ${C.blue}33`,
+          }}
+        >
+          <Users size={17} /> Start Squad Session
+        </button>
 
-          <div className="fg-mono" style={{ color: C.textLo, fontSize: 12, letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 12 }}>
-            Your Gym ({friends.length})
+        <div className="fg-mono" style={{ color: C.textLo, fontSize: 12, letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 12 }}>
+          Your Gym ({friends.length})
+        </div>
+        {friends.length === 0 ? (
+          <div className="fg-mono" style={{ color: C.textLo, fontSize: 13, textAlign: "center", padding: 30, border: `1px dashed ${C.line}`, borderRadius: 12 }}>
+            No one here yet — send the invite link above to bring in your first training partner.
           </div>
+        ) : (
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
             {friends.map((f) => (
               <div key={f.id} style={{ display: "flex", alignItems: "center", gap: 12, background: C.bgCard, border: `1px solid ${C.line}`, borderRadius: 12, padding: "12px 14px" }}>
@@ -4125,96 +4417,59 @@ function SocialScreen({ user, onBack, onSignOut, onStartSquad }) {
               </div>
             ))}
           </div>
+        )}
 
-          {invitedToast && (
-            <div className="fg-mono" style={{ position: "fixed", bottom: 24, left: "50%", transform: "translateX(-50%)", background: "#16A34A", color: "white", padding: "10px 18px", borderRadius: 10, fontSize: 13, boxShadow: "0 8px 24px rgba(0,0,0,0.4)" }}>
-              Invited {invitedToast} to lift 💪
-            </div>
-          )}
-        </div>
-      )}
+        {invitedToast && (
+          <div className="fg-mono" style={{ position: "fixed", bottom: 24, left: "50%", transform: "translateX(-50%)", background: "#16A34A", color: "white", padding: "10px 18px", borderRadius: 10, fontSize: 13, boxShadow: "0 8px 24px rgba(0,0,0,0.4)" }}>
+            Invited {invitedToast} to lift 💪
+          </div>
+        )}
+      </div>
 
-      {/* ===== REQUESTS TAB ===== */}
-      {tab === "Requests" && (
-        <div style={{ padding: "18px 20px 0" }}>
-          {requests.length === 0 ? (
-            <div className="fg-mono" style={{ color: C.textLo, fontSize: 13, textAlign: "center", padding: 30, border: `1px dashed ${C.line}`, borderRadius: 12 }}>
-              No pending requests.
+      {showProfile && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 60, display: "flex", alignItems: "flex-end" }} onClick={() => setShowProfile(false)}>
+          <div onClick={(e) => e.stopPropagation()} style={{ width: "100%", background: C.bgRaised, borderTop: `1px solid ${C.line}`, borderRadius: "20px 20px 0 0", padding: 22, maxHeight: "80vh", overflowY: "auto" }}>
+            <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 4 }}>
+              <button onClick={() => setShowProfile(false)} style={{ background: "none", border: "none" }}>
+                <X size={20} color={C.textLo} />
+              </button>
             </div>
-          ) : (
-            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-              {requests.map((r) => (
-                <div key={r.id} style={{ background: C.bgCard, border: `1px solid ${C.line}`, borderRadius: 12, padding: "14px" }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 12 }}>
-                    <Avatar name={r.name} />
-                    <div style={{ flex: 1 }}>
-                      <div className="fg-display" style={{ color: C.textHi, fontSize: 16, fontWeight: 600 }}>{r.name}</div>
-                      <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, marginTop: 2 }}>
-                        {r.mutual > 0 ? `${r.mutual} mutual connections` : "New to FORGE"}
-                      </div>
-                    </div>
-                  </div>
-                  <div style={{ display: "flex", gap: 8 }}>
-                    <button
-                      onClick={() => declineRequest(r)}
-                      className="fg-display"
-                      style={{ flex: 1, background: "transparent", border: `1px solid ${C.line}`, borderRadius: 10, padding: "11px", color: C.textLo, fontWeight: 600, fontSize: 14 }}
-                    >
-                      Decline
-                    </button>
-                    <button
-                      onClick={() => acceptRequest(r)}
-                      className="fg-display"
-                      style={{ flex: 1, background: C.blue, border: "none", borderRadius: 10, padding: "11px", color: "white", fontWeight: 700, fontSize: 14 }}
-                    >
-                      Accept
-                    </button>
-                  </div>
+            <div style={{ display: "flex", flexDirection: "column", alignItems: "center", marginBottom: 26 }}>
+              <Avatar name={user?.name || "Casey"} size={72} />
+              <div className="fg-display" style={{ color: C.textHi, fontSize: 24, fontWeight: 700, marginTop: 12 }}>
+                {user?.name || "Casey"}
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 4 }}>
+                <Mail size={12} color={C.textLo} />
+                <span className="fg-mono" style={{ color: C.textLo, fontSize: 12 }}>{user?.email || "you@forge.app"}</span>
+              </div>
+            </div>
+
+            <div style={{ display: "flex", gap: 10, marginBottom: 24 }}>
+              {[
+                ["Friends", friends.length],
+                ["Streak", `${streak}d`],
+                ["Sessions", sessionCount],
+              ].map(([label, val]) => (
+                <div key={label} style={{ flex: 1, background: C.bgCard, border: `1px solid ${C.line}`, borderRadius: 12, padding: "14px 8px", textAlign: "center" }}>
+                  <div className="fg-display" style={{ color: C.textHi, fontSize: 20, fontWeight: 700 }}>{val}</div>
+                  <div className="fg-mono" style={{ color: C.textLo, fontSize: 10, marginTop: 2 }}>{label}</div>
                 </div>
               ))}
             </div>
-          )}
-        </div>
-      )}
 
-      {/* ===== PROFILE TAB ===== */}
-      {tab === "Profile" && (
-        <div style={{ padding: "18px 20px 0" }}>
-          <div style={{ display: "flex", flexDirection: "column", alignItems: "center", marginBottom: 26 }}>
-            <Avatar name={user?.name || "Casey"} size={72} />
-            <div className="fg-display" style={{ color: C.textHi, fontSize: 24, fontWeight: 700, marginTop: 12 }}>
-              {user?.name || "Casey"}
-            </div>
-            <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 4 }}>
-              <Mail size={12} color={C.textLo} />
-              <span className="fg-mono" style={{ color: C.textLo, fontSize: 12 }}>{user?.email || "you@forge.app"}</span>
-            </div>
+            <button
+              onClick={onSignOut}
+              className="fg-display"
+              style={{
+                width: "100%", background: "transparent", border: `1px solid #EF4444`, borderRadius: 12,
+                padding: "14px", color: "#EF4444", fontWeight: 700, fontSize: 15,
+                display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
+              }}
+            >
+              <LogOut size={16} /> Sign Out
+            </button>
           </div>
-
-          <div style={{ display: "flex", gap: 10, marginBottom: 24 }}>
-            {[
-              ["Friends", friends.length],
-              ["Streak", "5d"],
-              ["Sessions", "12"],
-            ].map(([label, val]) => (
-              <div key={label} style={{ flex: 1, background: C.bgCard, border: `1px solid ${C.line}`, borderRadius: 12, padding: "14px 8px", textAlign: "center" }}>
-                <div className="fg-display" style={{ color: C.textHi, fontSize: 20, fontWeight: 700 }}>{val}</div>
-                <div className="fg-mono" style={{ color: C.textLo, fontSize: 10, marginTop: 2 }}>{label}</div>
-              </div>
-            ))}
-          </div>
-
-          <button
-            onClick={onSignOut}
-            className="fg-display"
-            style={{
-              width: "100%", background: "transparent", border: `1px solid #EF4444`, borderRadius: 12,
-              padding: "14px", color: "#EF4444", fontWeight: 700, fontSize: 15,
-              display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
-            }}
-          >
-            <LogOut size={16} /> Sign Out
-          </button>
         </div>
       )}
     </div>
@@ -4337,19 +4592,22 @@ function SquadSessionScreen({
   onAutoAssignStarts, onAssignStart, onAdvanceMe, onResetRotation,
   onStartSquadWorkout, onSaveTemplate,
 }) {
-  const [tab, setTab] = useState("Roster");
   const [buildSubTab, setBuildSubTab] = useState("Library");
   const [chat, setChat] = useState(SQUAD_CHAT_SEED);
   const [chatText, setChatText] = useState("");
   const chatScrollRef = useRef(null);
+  const [showBuildTogether, setShowBuildTogether] = useState(false);
+  const [showChat, setShowChat] = useState(false);
+  const [lastSeenChatCount, setLastSeenChatCount] = useState(SQUAD_CHAT_SEED.length);
 
   useEffect(() => {
     if (chatScrollRef.current) chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight;
-  }, [chat, tab]);
+  }, [chat, showChat]);
   const [bpm, setBpm] = useState(128);
   const [playing, setPlaying] = useState(false);
   const [assigningMember, setAssigningMember] = useState(null);
   const [doneFlash, setDoneFlash] = useState(false);
+  const [previewing, setPreviewing] = useState(false);
   const roomCode = useMemo(() => `SQD-${Math.floor(1000 + Math.random() * 9000)}`, []);
 
   const sendChat = (text) => {
@@ -4358,13 +4616,32 @@ function SquadSessionScreen({
     setChatText("");
   };
 
+  const openChat = () => {
+    setShowChat(true);
+    setLastSeenChatCount(chat.length);
+  };
+
+  const unreadChat = chat.length - lastSeenChatCount;
+
   const n = squadSequence.length;
   const me = squadMembers.find((m) => m.isMe);
   const leaderboard = [...squadMembers]
     .map((m) => ({ ...m, points: m.completedCount * 10 + m.streak * 5 }))
     .sort((a, b) => b.points - a.points);
 
-  const tabs = ["Roster", "Build Together", "Chat", "Leaderboard"];
+  if (previewing) {
+    const startAt = me ? me.currentIndex % Math.max(1, n) : 0;
+    const rotated = n > 0 ? [...squadSequence.slice(startAt), ...squadSequence.slice(0, startAt)] : [];
+    return (
+      <WorkoutPreviewScreen
+        buildList={rotated}
+        burnoutList={squadBurnout}
+        config={squadConfig}
+        onBack={() => setPreviewing(false)}
+        onConfirm={onStartSquadWorkout}
+      />
+    );
+  }
 
   return (
     <div style={{ minHeight: "100vh", background: C.bg, display: "flex", flexDirection: "column" }}>
@@ -4389,161 +4666,190 @@ function SquadSessionScreen({
         onTogglePlay={() => setPlaying((p) => !p)}
       />
 
-      <div style={{ display: "flex", gap: 6, padding: "12px 16px 0", overflowX: "auto" }}>
-        {tabs.map((t) => (
-          <button
-            key={t}
-            onClick={() => setTab(t)}
-            className="fg-display"
-            style={{
-              padding: "9px 14px", borderRadius: 20, border: `1px solid ${tab === t ? C.blue : C.line}`,
-              background: tab === t ? `${C.blue}1A` : "transparent", color: tab === t ? C.accent : C.textLo,
-              fontWeight: 600, fontSize: 13, flexShrink: 0, whiteSpace: "nowrap",
-            }}
-          >
-            {t}
-          </button>
-        ))}
+      {/* two clear secondary actions, not co-equal tabs — Roster is the one primary view */}
+      <div style={{ display: "flex", gap: 8, padding: "12px 20px 0" }}>
+        <button
+          onClick={() => setShowBuildTogether(true)}
+          className="fg-display"
+          style={{
+            flex: 1, padding: "12px 0", borderRadius: 10, border: `1px solid ${C.line}`, background: C.bgCard,
+            color: C.textHi, fontWeight: 600, fontSize: 14, display: "flex", alignItems: "center", justifyContent: "center", gap: 6,
+          }}
+        >
+          <LayoutList size={15} /> Build Together
+        </button>
+        <button
+          onClick={openChat}
+          className="fg-display"
+          style={{
+            flex: 1, padding: "12px 0", borderRadius: 10, border: `1px solid ${C.line}`, background: C.bgCard,
+            color: C.textHi, fontWeight: 600, fontSize: 14, display: "flex", alignItems: "center", justifyContent: "center", gap: 6, position: "relative",
+          }}
+        >
+          <MessageCircle size={15} /> Chat
+          {unreadChat > 0 && (
+            <span style={{ position: "absolute", top: 6, right: "28%", width: 8, height: 8, borderRadius: "50%", background: C.amber }} />
+          )}
+        </button>
       </div>
 
-      {/* ===== ROSTER ===== */}
-      {tab === "Roster" && (
-        <div style={{ padding: "18px 20px 20px", flex: 1 }}>
-          {n === 0 ? (
-            <div className="fg-mono" style={{ color: C.textLo, fontSize: 13, textAlign: "center", padding: 30, border: `1px dashed ${C.line}`, borderRadius: 12, marginBottom: 20 }}>
-              Build the shared station list in "Build Together" first, then come back here to set starting positions.
-            </div>
-          ) : (
-            <>
-              {/* station rotation assignment */}
-              <div style={{ background: C.bgCard, border: `1px solid ${C.line}`, borderRadius: 14, padding: 16, marginBottom: 18 }}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
-                  <div className="fg-display" style={{ color: C.textHi, fontSize: 16, fontWeight: 700 }}>Station Rotation</div>
-                  <div style={{ display: "flex", gap: 6 }}>
-                    <button
-                      onClick={onResetRotation}
-                      className="fg-mono"
-                      style={{ background: "transparent", border: `1px solid ${C.line}`, borderRadius: 8, padding: "6px 10px", color: C.textLo, fontSize: 11 }}
-                    >
-                      Reset
-                    </button>
-                    <button
-                      onClick={onAutoAssignStarts}
-                      className="fg-mono"
-                      style={{ background: `${C.blue}1A`, border: `1px solid ${C.blue}`, borderRadius: 8, padding: "6px 10px", color: C.accent, fontSize: 11 }}
-                    >
-                      Auto-Assign Starts
-                    </button>
-                  </div>
+      {/* ===== ROSTER (the one primary view) ===== */}
+      <div style={{ padding: "18px 20px 20px", flex: 1 }}>
+        {leaderboard.some((m) => m.points > 0) && (
+          <div style={{ display: "flex", gap: 8, marginBottom: 18, overflowX: "auto" }}>
+            {leaderboard.slice(0, 3).map((m, i) => (
+              <div key={m.id} style={{ flex: 1, minWidth: 100, background: C.bgCard, border: `1px solid ${i === 0 ? C.amber : C.line}`, borderRadius: 12, padding: "10px 12px", display: "flex", alignItems: "center", gap: 8 }}>
+                {i === 0 ? <Crown size={13} color={C.amber} /> : <span className="fg-mono" style={{ color: C.textLo, fontSize: 11 }}>{i + 1}</span>}
+                <div style={{ minWidth: 0, flex: 1 }}>
+                  <div className="fg-display" style={{ color: C.textHi, fontSize: 12, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{m.name}</div>
+                  <div className="fg-mono" style={{ color: C.accent, fontSize: 10, display: "flex", alignItems: "center", gap: 3 }}><Zap size={9} /> {m.points}</div>
                 </div>
-                <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, marginBottom: 12, lineHeight: 1.5 }}>
-                  {assigningMember ? `Tap a station to start ${assigningMember} there.` : "Tap a member below, then tap a station to set their starting point."}
-                </div>
-                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                  {squadSequence.map((st, i) => {
-                    const here = squadMembers.filter((m) => m.currentIndex % n === i);
-                    return (
-                      <div
-                        key={st.uid}
-                        onClick={() => { if (assigningMember) { onAssignStart(assigningMember, i); setAssigningMember(null); } }}
-                        style={{
-                          display: "flex", alignItems: "center", gap: 10, padding: "9px 10px", borderRadius: 8,
-                          background: assigningMember ? `${C.blue}0F` : "transparent",
-                          border: `1px solid ${assigningMember ? C.blue + "55" : "transparent"}`,
-                          cursor: assigningMember ? "pointer" : "default",
-                        }}
-                      >
-                        <span className="fg-mono" style={{ color: C.textLo, fontSize: 11, width: 16 }}>{i + 1}</span>
-                        <span className="fg-display" style={{ color: C.textHi, fontSize: 14, fontWeight: 600, flex: 1 }}>{st.name}</span>
-                        <div style={{ display: "flex", gap: 3 }}>
-                          {here.map((m) => (
-                            <div key={m.id} title={m.name} style={{ width: 18, height: 18, borderRadius: "50%", background: `linear-gradient(135deg, ${m.color[0]}, ${m.color[1]})`, display: "flex", alignItems: "center", justifyContent: "center" }}>
-                              <span className="fg-display" style={{ color: C.bg, fontWeight: 700, fontSize: 9 }}>{m.name[0]}</span>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-
-              {/* your turn */}
-              {me && (
-                <div style={{ background: `${C.blue}14`, border: `1px solid ${C.blue}`, borderRadius: 14, padding: 16, marginBottom: 18 }}>
-                  <div className="fg-mono" style={{ color: C.accent, fontSize: 11, letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: 6 }}>Your Station</div>
-                  <div className="fg-display" style={{ color: C.textHi, fontSize: 22, fontWeight: 700, marginBottom: 4 }}>{squadStationName(squadSequence, me.currentIndex)}</div>
-                  <div className="fg-mono" style={{ color: C.textLo, fontSize: 12, marginBottom: 14 }}>
-                    Round {Math.floor(me.completedCount / n) + 1} · {me.completedCount % n} of {n} stations this round
-                  </div>
-                  <div style={{ display: "flex", gap: 10 }}>
-                    <button
-                      onClick={() => { onAdvanceMe(); setDoneFlash(true); setTimeout(() => setDoneFlash(false), 1000); }}
-                      className="fg-display"
-                      style={{ flex: 1, background: doneFlash ? "#16A34A" : C.blue, border: "none", borderRadius: 10, padding: "13px", color: "white", fontWeight: 700, fontSize: 14, display: "flex", alignItems: "center", justifyContent: "center", gap: 6, transition: "background 0.2s" }}
-                    >
-                      {doneFlash ? <Check size={15} /> : null} {doneFlash ? "Nice work!" : "Done"} {!doneFlash && <ArrowRight size={15} />}
-                    </button>
-                    <button
-                      onClick={onStartSquadWorkout}
-                      className="fg-display"
-                      style={{ flex: 1, background: "#16A34A", border: "none", borderRadius: 10, padding: "13px", color: "white", fontWeight: 700, fontSize: 14 }}
-                    >
-                      Start Workout
-                    </button>
-                  </div>
-                </div>
-              )}
-            </>
-          )}
-
-          <div className="fg-mono" style={{ color: C.textLo, fontSize: 12, letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 10 }}>Squad</div>
-          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-            {squadMembers.map((m) => (
-              <div key={m.id} style={{ background: C.bgCard, border: `1px solid ${C.line}`, borderRadius: 14, padding: 14, display: "flex", alignItems: "center", gap: 12 }}>
-                <div
-                  onClick={() => !m.isMe && n > 0 && setAssigningMember(assigningMember === m.id ? null : m.id)}
-                  style={{ position: "relative", cursor: !m.isMe && n > 0 ? "pointer" : "default" }}
-                >
-                  <div
-                    style={{
-                      width: 42, height: 42, borderRadius: "50%", background: `linear-gradient(135deg, ${m.color[0]}, ${m.color[1]})`,
-                      display: "flex", alignItems: "center", justifyContent: "center",
-                      boxShadow: assigningMember === m.id ? `0 0 0 3px ${C.blue}` : "none",
-                    }}
-                  >
-                    <span className="fg-display" style={{ color: C.bg, fontWeight: 700, fontSize: 16 }}>{m.name[0]}</span>
-                  </div>
-                  <div style={{ position: "absolute", bottom: -1, right: -1, width: 11, height: 11, borderRadius: "50%", background: m.online ? "#22C55E" : C.textLo, border: `2px solid ${C.bgCard}` }} />
-                </div>
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div className="fg-display" style={{ color: C.textHi, fontSize: 16, fontWeight: 600 }}>
-                    {m.name} {m.isMe && <span className="fg-mono" style={{ color: C.textLo, fontSize: 10 }}>(you)</span>}
-                  </div>
-                  <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, marginTop: 2 }}>
-                    {n === 0 ? "No stations yet" : m.online ? `On: ${squadStationName(squadSequence, m.currentIndex)}` : "Resting / offline"} · {m.completedCount} done
-                  </div>
-                  {n > 0 && (
-                    <div style={{ height: 4, borderRadius: 2, background: C.line, marginTop: 6, overflow: "hidden" }}>
-                      <div style={{ height: "100%", width: `${Math.min(100, ((m.completedCount % n) / n) * 100)}%`, background: `linear-gradient(90deg, ${m.color[0]}, ${m.color[1]})` }} />
-                    </div>
-                  )}
-                </div>
-                {m.streak > 0 && (
-                  <div className="fg-mono" style={{ color: C.amber, fontSize: 11, display: "flex", alignItems: "center", gap: 3, flexShrink: 0 }}>
-                    <Flame size={12} /> {m.streak}d
-                  </div>
-                )}
               </div>
             ))}
           </div>
-        </div>
-      )}
+        )}
 
-      {/* ===== BUILD TOGETHER ===== */}
-      {tab === "Build Together" && (
-        <div style={{ flex: 1, display: "flex", flexDirection: "column" }}>
-          <div className="fg-mono" style={{ color: C.textLo, fontSize: 12, padding: "14px 20px 0", lineHeight: 1.5 }}>
+        {n === 0 ? (
+          <div className="fg-mono" style={{ color: C.textLo, fontSize: 13, textAlign: "center", padding: 30, border: `1px dashed ${C.line}`, borderRadius: 12, marginBottom: 20 }}>
+            Tap "Build Together" above to add exercises, then come back here to set starting positions.
+          </div>
+        ) : (
+          <>
+            {/* station rotation assignment */}
+            <div style={{ background: C.bgCard, border: `1px solid ${C.line}`, borderRadius: 14, padding: 16, marginBottom: 18 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+                <div className="fg-display" style={{ color: C.textHi, fontSize: 16, fontWeight: 700 }}>Station Rotation</div>
+                <div style={{ display: "flex", gap: 6 }}>
+                  <button
+                    onClick={onResetRotation}
+                    className="fg-mono"
+                    style={{ background: "transparent", border: `1px solid ${C.line}`, borderRadius: 8, padding: "6px 10px", color: C.textLo, fontSize: 11 }}
+                  >
+                    Reset
+                  </button>
+                  <button
+                    onClick={onAutoAssignStarts}
+                    className="fg-mono"
+                    style={{ background: `${C.blue}1A`, border: `1px solid ${C.blue}`, borderRadius: 8, padding: "6px 10px", color: C.accent, fontSize: 11 }}
+                  >
+                    Auto-Assign Starts
+                  </button>
+                </div>
+              </div>
+              <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, marginBottom: 12, lineHeight: 1.5 }}>
+                {assigningMember ? `Tap a station to start ${assigningMember} there.` : "Tap a member below, then tap a station to set their starting point."}
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                {squadSequence.map((st, i) => {
+                  const here = squadMembers.filter((m) => m.currentIndex % n === i);
+                  return (
+                    <div
+                      key={st.uid}
+                      onClick={() => { if (assigningMember) { onAssignStart(assigningMember, i); setAssigningMember(null); } }}
+                      style={{
+                        display: "flex", alignItems: "center", gap: 10, padding: "9px 10px", borderRadius: 8,
+                        background: assigningMember ? `${C.blue}0F` : "transparent",
+                        border: `1px solid ${assigningMember ? C.blue + "55" : "transparent"}`,
+                        cursor: assigningMember ? "pointer" : "default",
+                      }}
+                    >
+                      <span className="fg-mono" style={{ color: C.textLo, fontSize: 11, width: 16 }}>{i + 1}</span>
+                      <span className="fg-display" style={{ color: C.textHi, fontSize: 14, fontWeight: 600, flex: 1 }}>{st.name}</span>
+                      <div style={{ display: "flex", gap: 3 }}>
+                        {here.map((m) => (
+                          <div key={m.id} title={m.name} style={{ width: 18, height: 18, borderRadius: "50%", background: `linear-gradient(135deg, ${m.color[0]}, ${m.color[1]})`, display: "flex", alignItems: "center", justifyContent: "center" }}>
+                            <span className="fg-display" style={{ color: C.bg, fontWeight: 700, fontSize: 9 }}>{m.name[0]}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* your turn */}
+            {me && (
+              <div style={{ background: `${C.blue}14`, border: `1px solid ${C.blue}`, borderRadius: 14, padding: 16, marginBottom: 18 }}>
+                <div className="fg-mono" style={{ color: C.accent, fontSize: 11, letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: 6 }}>Your Station</div>
+                <div className="fg-display" style={{ color: C.textHi, fontSize: 22, fontWeight: 700, marginBottom: 4 }}>{squadStationName(squadSequence, me.currentIndex)}</div>
+                <div className="fg-mono" style={{ color: C.textLo, fontSize: 12, marginBottom: 14 }}>
+                  Round {Math.floor(me.completedCount / n) + 1} · {me.completedCount % n} of {n} stations this round
+                </div>
+                <div style={{ display: "flex", gap: 10 }}>
+                  <button
+                    onClick={() => { onAdvanceMe(); setDoneFlash(true); setTimeout(() => setDoneFlash(false), 1000); }}
+                    className="fg-display"
+                    style={{ flex: 1, background: doneFlash ? "#16A34A" : C.blue, border: "none", borderRadius: 10, padding: "13px", color: "white", fontWeight: 700, fontSize: 14, display: "flex", alignItems: "center", justifyContent: "center", gap: 6, transition: "background 0.2s" }}
+                  >
+                    {doneFlash ? <Check size={15} /> : null} {doneFlash ? "Nice work!" : "Done"} {!doneFlash && <ArrowRight size={15} />}
+                  </button>
+                  <button
+                    onClick={() => setPreviewing(true)}
+                    className="fg-display"
+                    style={{ flex: 1, background: "#16A34A", border: "none", borderRadius: 10, padding: "13px", color: "white", fontWeight: 700, fontSize: 14 }}
+                  >
+                    Start Workout
+                  </button>
+                </div>
+              </div>
+            )}
+          </>
+        )}
+
+        <div className="fg-mono" style={{ color: C.textLo, fontSize: 12, letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 10 }}>Squad</div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          {squadMembers.map((m) => (
+            <div key={m.id} style={{ background: C.bgCard, border: `1px solid ${C.line}`, borderRadius: 14, padding: 14, display: "flex", alignItems: "center", gap: 12 }}>
+              <div
+                onClick={() => !m.isMe && n > 0 && setAssigningMember(assigningMember === m.id ? null : m.id)}
+                style={{ position: "relative", cursor: !m.isMe && n > 0 ? "pointer" : "default" }}
+              >
+                <div
+                  style={{
+                    width: 42, height: 42, borderRadius: "50%", background: `linear-gradient(135deg, ${m.color[0]}, ${m.color[1]})`,
+                    display: "flex", alignItems: "center", justifyContent: "center",
+                    boxShadow: assigningMember === m.id ? `0 0 0 3px ${C.blue}` : "none",
+                  }}
+                >
+                  <span className="fg-display" style={{ color: C.bg, fontWeight: 700, fontSize: 16 }}>{m.name[0]}</span>
+                </div>
+                <div style={{ position: "absolute", bottom: -1, right: -1, width: 11, height: 11, borderRadius: "50%", background: m.online ? "#22C55E" : C.textLo, border: `2px solid ${C.bgCard}` }} />
+              </div>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div className="fg-display" style={{ color: C.textHi, fontSize: 16, fontWeight: 600 }}>
+                  {m.name} {m.isMe && <span className="fg-mono" style={{ color: C.textLo, fontSize: 10 }}>(you)</span>}
+                </div>
+                <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, marginTop: 2 }}>
+                  {n === 0 ? "No stations yet" : m.online ? `On: ${squadStationName(squadSequence, m.currentIndex)}` : "Resting / offline"} · {m.completedCount} done
+                </div>
+                {n > 0 && (
+                  <div style={{ height: 4, borderRadius: 2, background: C.line, marginTop: 6, overflow: "hidden" }}>
+                    <div style={{ height: "100%", width: `${Math.min(100, ((m.completedCount % n) / n) * 100)}%`, background: `linear-gradient(90deg, ${m.color[0]}, ${m.color[1]})` }} />
+                  </div>
+                )}
+              </div>
+              {m.streak > 0 && (
+                <div className="fg-mono" style={{ color: C.amber, fontSize: 11, display: "flex", alignItems: "center", gap: 3, flexShrink: 0 }}>
+                  <Flame size={12} /> {m.streak}d
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* ===== BUILD TOGETHER (overlay) ===== */}
+      {showBuildTogether && (
+        <div style={{ position: "fixed", inset: 0, background: C.bg, zIndex: 70, display: "flex", flexDirection: "column" }}>
+          <FontImport />
+          <div style={{ padding: "20px 20px 0", display: "flex", alignItems: "center", gap: 12 }}>
+            <button onClick={() => setShowBuildTogether(false)} style={{ background: "none", border: "none" }}>
+              <ArrowLeft size={20} color={C.textLo} />
+            </button>
+            <h2 className="fg-display" style={{ color: C.textHi, fontSize: 22, fontWeight: 700, margin: 0 }}>Build Together</h2>
+          </div>
+          <div className="fg-mono" style={{ color: C.textLo, fontSize: 12, padding: "10px 20px 0", lineHeight: 1.5 }}>
             The same Library and Builder you use for personal workouts — anything added here is shared with the whole squad.
           </div>
           <div style={{ display: "flex", gap: 8, padding: "12px 20px 0" }}>
@@ -4587,10 +4893,17 @@ function SquadSessionScreen({
         </div>
       )}
 
-      {/* ===== CHAT ===== */}
-      {tab === "Chat" && (
-        <div style={{ flex: 1, display: "flex", flexDirection: "column", padding: "12px 0 0" }}>
-          <div ref={chatScrollRef} style={{ flex: 1, overflowY: "auto", padding: "8px 20px" }}>
+      {/* ===== CHAT (overlay) ===== */}
+      {showChat && (
+        <div style={{ position: "fixed", inset: 0, background: C.bg, zIndex: 70, display: "flex", flexDirection: "column" }}>
+          <FontImport />
+          <div style={{ padding: "20px 20px 0", display: "flex", alignItems: "center", gap: 12 }}>
+            <button onClick={() => setShowChat(false)} style={{ background: "none", border: "none" }}>
+              <ArrowLeft size={20} color={C.textLo} />
+            </button>
+            <h2 className="fg-display" style={{ color: C.textHi, fontSize: 22, fontWeight: 700, margin: 0 }}>Squad Chat</h2>
+          </div>
+          <div ref={chatScrollRef} style={{ flex: 1, overflowY: "auto", padding: "16px 20px" }}>
             {chat.map((m) => (
               <div key={m.id} style={{ display: "flex", justifyContent: m.mine ? "flex-end" : "flex-start", marginBottom: 10 }}>
                 <div
@@ -4635,34 +4948,6 @@ function SquadSessionScreen({
           </div>
         </div>
       )}
-
-      {/* ===== LEADERBOARD ===== */}
-      {tab === "Leaderboard" && (
-        <div style={{ padding: "18px 20px 20px", flex: 1 }}>
-          <div className="fg-mono" style={{ color: C.textLo, fontSize: 12, marginBottom: 16, lineHeight: 1.5 }}>
-            Points from sets logged and current streaks. Purely for fun — nothing here is verified or synced yet.
-          </div>
-          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-            {leaderboard.map((m, i) => (
-              <div key={m.id} style={{ display: "flex", alignItems: "center", gap: 12, background: C.bgCard, border: `1px solid ${i === 0 ? C.amber : C.line}`, borderRadius: 12, padding: "13px 14px" }}>
-                <div style={{ width: 26, textAlign: "center", flexShrink: 0 }}>
-                  {i === 0 ? <Crown size={16} color={C.amber} /> : <span className="fg-mono" style={{ color: C.textLo, fontSize: 13 }}>{i + 1}</span>}
-                </div>
-                <div style={{ width: 36, height: 36, borderRadius: "50%", background: `linear-gradient(135deg, ${m.color[0]}, ${m.color[1]})`, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
-                  <span className="fg-display" style={{ color: C.bg, fontWeight: 700, fontSize: 14 }}>{m.name[0]}</span>
-                </div>
-                <div style={{ flex: 1 }}>
-                  <div className="fg-display" style={{ color: C.textHi, fontSize: 15, fontWeight: 600 }}>{m.name}{m.isMe ? " (you)" : ""}</div>
-                  <div className="fg-mono" style={{ color: C.textLo, fontSize: 11 }}>{m.completedCount} stations done · {m.streak}d streak</div>
-                </div>
-                <div className="fg-display" style={{ color: C.accent, fontSize: 17, fontWeight: 700, display: "flex", alignItems: "center", gap: 4 }}>
-                  <Zap size={13} /> {m.points}
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
     </div>
   );
 }
@@ -4670,6 +4955,113 @@ function SquadSessionScreen({
 /* ============================================================
    APP SHELL
    ============================================================ */
+/* ============================================================
+   ONBOARDING TUTORIAL — shown exactly once per real account,
+   right after their first successful login. Status is stored on
+   the profile itself (not locally), so it correctly follows the
+   account across devices instead of reappearing on a new browser.
+   ============================================================ */
+const ONBOARDING_STEPS = [
+  {
+    icon: Dumbbell,
+    title: "Welcome to FORGE",
+    body: "A synchronized training app built for you and the people you train with — solo or together, in the same room or apart.",
+  },
+  {
+    icon: HomeIcon,
+    title: "Home is your launchpad",
+    body: "Quick-start a workout, jump into a saved Template, log something freeform, or pick up right where a template or Squad session left off.",
+  },
+  {
+    icon: LayoutList,
+    title: "Build it your way",
+    body: "Pick exercises from the Library, drag to reorder, link supersets, and choose how it runs — Timer, Reps, or self-paced Sequence. Circuit or Exercise-First, your call.",
+  },
+  {
+    icon: Play,
+    title: "Train with a real timer",
+    body: "Work and rest auto-advance for you. Tap Log Set anytime — even mid-set — to record reps, weight, and effort without breaking stride.",
+  },
+  {
+    icon: TrendingUp,
+    title: "Watch it add up",
+    body: "Every set you log builds real History — PRs, volume trends, and progress charts, all from what you actually did.",
+  },
+  {
+    icon: Users,
+    title: "Train together",
+    body: "Invite people, build a Squad Session together, and share a station rotation — everyone moving through the same stations, together.",
+  },
+];
+
+function OnboardingTutorialScreen({ onDone }) {
+  const [step, setStep] = useState(0);
+  const isLast = step === ONBOARDING_STEPS.length - 1;
+  const current = ONBOARDING_STEPS[step];
+  const Icon = current.icon;
+
+  return (
+    <div style={{ minHeight: "100vh", background: C.bg, display: "flex", flexDirection: "column", padding: 24 }}>
+      <FontImport />
+
+      <div style={{ display: "flex", justifyContent: "flex-end" }}>
+        <button onClick={onDone} className="fg-mono" style={{ background: "none", border: "none", color: C.textLo, fontSize: 13, padding: 8 }}>
+          Skip
+        </button>
+      </div>
+
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", textAlign: "center" }}>
+        <div
+          style={{
+            width: 84, height: 84, borderRadius: 22, marginBottom: 30,
+            background: `linear-gradient(135deg, ${C.blue}, ${C.accent})`,
+            display: "flex", alignItems: "center", justifyContent: "center",
+            boxShadow: `0 0 40px ${C.blue}44`,
+          }}
+        >
+          <Icon size={38} color={C.bg} strokeWidth={2} />
+        </div>
+        <h1 className="fg-display" style={{ color: C.textHi, fontSize: 30, fontWeight: 700, margin: "0 0 14px", maxWidth: 320 }}>
+          {current.title}
+        </h1>
+        <p style={{ color: C.textLo, fontSize: 15, lineHeight: 1.6, maxWidth: 320, margin: 0 }}>
+          {current.body}
+        </p>
+      </div>
+
+      <div style={{ display: "flex", justifyContent: "center", gap: 6, marginBottom: 26 }}>
+        {ONBOARDING_STEPS.map((_, i) => (
+          <div key={i} style={{ width: i === step ? 20 : 6, height: 6, borderRadius: 3, background: i === step ? C.blue : C.line, transition: "width 0.2s" }} />
+        ))}
+      </div>
+
+      <div style={{ display: "flex", gap: 10 }}>
+        {step > 0 && (
+          <button
+            onClick={() => setStep((s) => s - 1)}
+            className="fg-display"
+            style={{ flex: 1, background: "transparent", border: `1px solid ${C.line}`, borderRadius: 12, padding: "16px", color: C.textLo, fontWeight: 600, fontSize: 16 }}
+          >
+            Back
+          </button>
+        )}
+        <button
+          onClick={() => (isLast ? onDone() : setStep((s) => s + 1))}
+          className="fg-display"
+          style={{
+            flex: 2, background: `linear-gradient(135deg, ${C.blue}, #1D4ED8)`, border: "none", borderRadius: 12,
+            padding: "16px", color: "white", fontWeight: 700, fontSize: 16,
+            display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
+          }}
+        >
+          {isLast ? "Get Started" : "Next"} <ArrowRight size={17} />
+        </button>
+      </div>
+    </div>
+  );
+}
+
+
 function AppLoadingScreen() {
   return (
     <div style={{ minHeight: "100vh", background: C.bg, display: "flex", alignItems: "center", justifyContent: "center" }}>
@@ -4682,26 +5074,27 @@ function AppLoadingScreen() {
 export default function App() {
   const [authSession, setAuthSession] = useState(null); // {access_token, refresh_token, expires_at, user:{id,email,name}}
   const [view, setView] = useState("home"); // home | builder | active | freestyle | history | social | squad
-  const [session, setSession] = useState({ buildList: [], burnoutList: [], config: { mode: "Timer", work: 40, rest: 20, rounds: 3, targetReps: 12 }, squadInfo: null });
+  const [session, setSession] = useState({ buildList: [], burnoutList: [], config: { mode: "Timer", work: 40, rest: 20, rounds: 3, targetReps: 12, rotationMode: "Exercise-First", circuitTransition: 10 }, squadInfo: null });
   const [history, setHistory] = useState([]);
   const [templates, setTemplates] = useState(PRESET_TEMPLATES);
   const [pendingTemplate, setPendingTemplate] = useState(null);
   const [hydrated, setHydrated] = useState(false);
   const [cloudError, setCloudError] = useState("");
+  const [needsOnboarding, setNeedsOnboarding] = useState(false);
 
-  const user = authSession ? { name: authSession.user.name || authSession.user.email.split("@")[0], email: authSession.user.email } : null;
+  const user = authSession ? { id: authSession.user.id, name: authSession.user.name || authSession.user.email.split("@")[0], email: authSession.user.email } : null;
 
   // squad rotation state — lifted to App so it keeps ticking even while
-  // you're inside your own Active Workout screen (see squadInfo below)
-  const [squadSequence, setSquadSequence] = useState(() => [
-    { ...exById("ex1"), uid: nextUid(), modeOverride: "Session Default", addedBy: "Jess" },
-    { ...exById("ex5"), uid: nextUid(), modeOverride: "Session Default", addedBy: "You" },
-    { ...exById("ex2"), uid: nextUid(), modeOverride: "Session Default", addedBy: "Marcus" },
-    { ...exById("ex9"), uid: nextUid(), modeOverride: "Session Default", addedBy: "You" },
-  ]);
+  // you're inside your own Active Workout screen (see squadInfo below).
+  // Starts genuinely empty for a fresh account — no pre-filled fake
+  // friends or exercises; "You" is the only real member until people
+  // are actually invited in.
+  const [squadSequence, setSquadSequence] = useState([]);
   const [squadBurnout, setSquadBurnout] = useState([]);
-  const [squadConfig, setSquadConfig] = useState({ mode: "Timer", work: 40, rest: 20, rounds: 1, targetReps: 10 });
-  const [squadMembers, setSquadMembers] = useState(SQUAD_MEMBERS_SEED);
+  const [squadConfig, setSquadConfig] = useState({ mode: "Timer", work: 40, rest: 20, rounds: 1, targetReps: 10, rotationMode: "Exercise-First", circuitTransition: 10 });
+  const [squadMembers, setSquadMembers] = useState([
+    { id: "me", name: "You", isMe: true, color: [C.blue, C.accent], online: true, startIndex: 0, currentIndex: 0, completedCount: 0, streak: 0 },
+  ]);
 
   // background tick: other squad members quietly progress through their rotation
   useEffect(() => {
@@ -4729,9 +5122,14 @@ export default function App() {
         if (token) {
           setAuthSession((s) => s || stored);
           try {
-            const [cloudHistory, cloudTemplates] = await Promise.all([fetchCloudHistory(token), fetchCloudTemplates(token)]);
+            const [cloudHistory, cloudTemplates, onboarded] = await Promise.all([
+              fetchCloudHistory(token),
+              fetchCloudTemplates(token),
+              fetchHasOnboarded(token, stored.user.id),
+            ]);
             setHistory(cloudHistory);
             setTemplates([...PRESET_TEMPLATES, ...cloudTemplates]);
+            setNeedsOnboarding(!onboarded);
           } catch (e) {
             setCloudError("Couldn't reach the server — showing what's cached locally.");
           }
@@ -4749,9 +5147,14 @@ export default function App() {
   const handleAuthed = async (newSession) => {
     setAuthSession(newSession);
     try {
-      const [cloudHistory, cloudTemplates] = await Promise.all([fetchCloudHistory(newSession.access_token), fetchCloudTemplates(newSession.access_token)]);
+      const [cloudHistory, cloudTemplates, onboarded] = await Promise.all([
+        fetchCloudHistory(newSession.access_token),
+        fetchCloudTemplates(newSession.access_token),
+        fetchHasOnboarded(newSession.access_token, newSession.user.id),
+      ]);
       setHistory(cloudHistory);
       setTemplates([...PRESET_TEMPLATES, ...cloudTemplates]);
+      setNeedsOnboarding(!onboarded);
     } catch (e) {
       setCloudError("Signed in, but couldn't load your data from the server yet.");
     }
@@ -4761,7 +5164,13 @@ export default function App() {
     setAuthSession(null);
     setHistory([]);
     setTemplates(PRESET_TEMPLATES);
+    setNeedsOnboarding(false);
     setView("home");
+  };
+
+  const finishOnboarding = () => {
+    setNeedsOnboarding(false);
+    if (authSession) markOnboarded(authSession.access_token, authSession.user.id).catch(() => {});
   };
 
   const saveSession = async (record) => {
@@ -4855,6 +5264,8 @@ export default function App() {
 
   if (!user) return <AuthScreen onAuthed={handleAuthed} />;
 
+  if (needsOnboarding) return <OnboardingTutorialScreen onDone={finishOnboarding} />;
+
   let screen;
 
   if (view === "squad") {
@@ -4882,6 +5293,7 @@ export default function App() {
     screen = (
       <SocialScreen
         user={user}
+        history={history}
         onBack={() => setView("home")}
         onSignOut={signOut}
         onStartSquad={() => setView("squad")}
