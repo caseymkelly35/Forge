@@ -401,7 +401,7 @@ const relativeDay = (ts) => {
   return `${diffDays} days ago`;
 };
 
-function HomeScreen({ user, history, templates, squadMembers, onStartBuild, onLoadTemplate, onStartFreestyle, onOpenHistory, onOpenSocial }) {
+function HomeScreen({ user, history, templates, squadMembers, activeProgramRow, onStartBuild, onLoadTemplate, onStartFreestyle, onOpenHistory, onOpenSocial, onOpenPrograms, onStartTodayWorkout }) {
   const firstName = (user?.name || "Casey").split(" ")[0];
   const onlinePartner = (squadMembers || []).find((m) => !m.isMe && m.online);
   const recentSessions = (history || []).slice(0, 3).map((s) => ({
@@ -410,6 +410,8 @@ function HomeScreen({ user, history, templates, squadMembers, onStartBuild, onLo
     sets: s.sets.length,
     duration: s.durationSec ? `${Math.round(s.durationSec / 60)} min` : "duration unknown",
   }));
+  const activeProgram = activeProgramRow ? PROGRAMS.find((p) => p.id === activeProgramRow.program_id) : null;
+  const todayInfo = activeProgramRow ? getTodayProgramDay(activeProgramRow) : null;
 
   const sectionLabel = (text) => (
     <div
@@ -444,6 +446,15 @@ function HomeScreen({ user, history, templates, squadMembers, onStartBuild, onLo
           </h1>
         </div>
         <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
+          <button
+            onClick={onOpenPrograms}
+            style={{
+              width: 40, height: 40, borderRadius: 10, background: C.bgCard, border: `1px solid ${C.line}`,
+              display: "flex", alignItems: "center", justifyContent: "center",
+            }}
+          >
+            <TrendingUp size={18} color={C.textLo} />
+          </button>
           <button
             onClick={onOpenSocial}
             style={{
@@ -494,6 +505,35 @@ function HomeScreen({ user, history, templates, squadMembers, onStartBuild, onLo
           </div>
         ))}
       </div>
+
+      {/* today's program workout */}
+      {activeProgram && todayInfo && !todayInfo.complete && (
+        <div style={{ padding: "18px 20px 6px" }}>
+          <div
+            onClick={onOpenPrograms}
+            style={{
+              background: `${activeProgram.color}14`, border: `1px solid ${activeProgram.color}`, borderRadius: 14,
+              padding: 16, cursor: "pointer",
+            }}
+          >
+            <div className="fg-mono" style={{ color: C.textLo, fontSize: 10, letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: 4 }}>
+              {activeProgram.name} · Week {todayInfo.week} of {activeProgram.durationWeeks}
+            </div>
+            <div className="fg-display" style={{ color: C.textHi, fontSize: 20, fontWeight: 700, marginBottom: 12 }}>
+              {todayInfo.dayDef && todayInfo.dayDef.type === "workout" ? todayInfo.dayDef.label : "Rest Day"}
+            </div>
+            {todayInfo.dayDef && todayInfo.dayDef.type === "workout" && (
+              <button
+                onClick={(e) => { e.stopPropagation(); onStartTodayWorkout(todayInfo.dayDef); }}
+                className="fg-display"
+                style={{ background: activeProgram.color, border: "none", borderRadius: 10, padding: "12px 20px", color: "white", fontWeight: 700, fontSize: 14, display: "flex", alignItems: "center", gap: 6 }}
+              >
+                <Play size={14} fill="white" /> Start Today's Workout
+              </button>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* partner status */}
       <div style={{ padding: "22px 20px 6px" }}>
@@ -758,6 +798,34 @@ const EXERCISES = [
   { id: "ex38", name: "Clean and Press", category: "Full Body", muscles: ["Full Body"], equipment: "Barbell", equipmentAlternatives: ["Dumbbell", "Kettlebell"], movementType: "Compound", difficulty: "Advanced", videoUrl: "" },
   { id: "ex39", name: "Turkish Get-Up", category: "Full Body", muscles: ["Full Body", "Core"], equipment: "Kettlebell", equipmentAlternatives: ["Dumbbell"], movementType: "Compound", difficulty: "Advanced", videoUrl: "" },
   { id: "ex40", name: "Thrusters", category: "Full Body", muscles: ["Quads", "Shoulders", "Full Body"], equipment: "Dumbbell", equipmentAlternatives: ["Barbell", "Kettlebell"], movementType: "Compound", difficulty: "Advanced", videoUrl: "" },
+
+  // Mobility / Recovery
+  { id: "ex41", name: "Thoracic Spine Rotation", category: "Mobility", muscles: ["Back"], equipment: "Bodyweight", equipmentAlternatives: [], movementType: "Mobility", difficulty: "Beginner", videoUrl: "" },
+  { id: "ex42", name: "Ankle Mobility Drill", category: "Mobility", muscles: ["Legs"], equipment: "Bodyweight", equipmentAlternatives: [], movementType: "Mobility", difficulty: "Beginner", videoUrl: "" },
+  { id: "ex43", name: "Pigeon Pose", category: "Mobility", muscles: ["Legs", "Glutes"], equipment: "Bodyweight", equipmentAlternatives: [], movementType: "Mobility", difficulty: "Beginner", videoUrl: "" },
+  { id: "ex44", name: "Standing Quad Stretch", category: "Mobility", muscles: ["Quads"], equipment: "Bodyweight", equipmentAlternatives: [], movementType: "Mobility", difficulty: "Beginner", videoUrl: "" },
+  { id: "ex45", name: "Child's Pose", category: "Mobility", muscles: ["Back", "Shoulders"], equipment: "Bodyweight", equipmentAlternatives: [], movementType: "Mobility", difficulty: "Beginner", videoUrl: "" },
+
+  // Athletic / Power
+  { id: "ex46", name: "Broad Jump", category: "HIIT", muscles: ["Quads", "Glutes"], equipment: "Bodyweight", equipmentAlternatives: [], movementType: "Compound", difficulty: "Advanced", videoUrl: "" },
+  { id: "ex47", name: "Lateral Bounds", category: "HIIT", muscles: ["Quads", "Glutes"], equipment: "Bodyweight", equipmentAlternatives: [], movementType: "Compound", difficulty: "Advanced", videoUrl: "" },
+  { id: "ex48", name: "Dumbbell Slam", category: "Full Body", muscles: ["Full Body", "Core"], equipment: "Dumbbell", equipmentAlternatives: ["Kettlebell"], movementType: "Compound", difficulty: "Advanced", videoUrl: "" },
+  { id: "ex49", name: "Single-Leg Romanian Deadlift", category: "Legs", muscles: ["Hamstrings", "Glutes"], equipment: "Dumbbell", equipmentAlternatives: ["Kettlebell", "Barbell"], movementType: "Compound", difficulty: "Intermediate", videoUrl: "" },
+  { id: "ex50", name: "High Knees", category: "HIIT", muscles: ["Core", "Full Body"], equipment: "Bodyweight", equipmentAlternatives: [], movementType: "Compound", difficulty: "Intermediate", videoUrl: "" },
+
+  // More machines / variety
+  { id: "ex51", name: "Cable Woodchopper", category: "Core", muscles: ["Core"], equipment: "Cable", equipmentAlternatives: ["Band"], movementType: "Isolation", difficulty: "Intermediate", videoUrl: "" },
+  { id: "ex52", name: "Leg Extension", category: "Legs", muscles: ["Quads"], equipment: "Machine", equipmentAlternatives: [], movementType: "Isolation", difficulty: "Beginner", videoUrl: "" },
+  { id: "ex53", name: "Leg Curl Machine", category: "Legs", muscles: ["Hamstrings"], equipment: "Machine", equipmentAlternatives: [], movementType: "Isolation", difficulty: "Beginner", videoUrl: "" },
+  { id: "ex54", name: "Chest Press Machine", category: "Chest", muscles: ["Chest", "Triceps"], equipment: "Machine", equipmentAlternatives: [], movementType: "Compound", difficulty: "Beginner", videoUrl: "" },
+  { id: "ex55", name: "Assisted Pull-Up Machine", category: "Back", muscles: ["Back", "Biceps"], equipment: "Machine", equipmentAlternatives: [], movementType: "Compound", difficulty: "Beginner", videoUrl: "" },
+  { id: "ex56", name: "Preacher Curl", category: "Arms", muscles: ["Biceps"], equipment: "Barbell", equipmentAlternatives: ["Dumbbell"], movementType: "Isolation", difficulty: "Intermediate", videoUrl: "" },
+
+  // Full body / conditioning
+  { id: "ex57", name: "Devil's Press", category: "Full Body", muscles: ["Full Body"], equipment: "Dumbbell", equipmentAlternatives: [], movementType: "Compound", difficulty: "Advanced", videoUrl: "" },
+  { id: "ex58", name: "Farmer's Carry", category: "Full Body", muscles: ["Full Body", "Core"], equipment: "Dumbbell", equipmentAlternatives: ["Kettlebell"], movementType: "Compound", difficulty: "Intermediate", videoUrl: "" },
+  { id: "ex59", name: "Wall Ball", category: "Full Body", muscles: ["Quads", "Shoulders", "Full Body"], equipment: "Kettlebell", equipmentAlternatives: ["Dumbbell"], movementType: "Compound", difficulty: "Intermediate", videoUrl: "" },
+  { id: "ex60", name: "Rowing Sprint", category: "HIIT", muscles: ["Full Body"], equipment: "Machine", equipmentAlternatives: [], movementType: "Compound", difficulty: "Intermediate", videoUrl: "" },
 ];
 
 const ALL_EQUIPMENT = ["Bodyweight", "Barbell", "Dumbbell", "Kettlebell", "Cable", "Machine", "Band"];
@@ -833,6 +901,202 @@ const PRESET_TEMPLATES = [
     burnoutItems: [],
   },
 ];
+
+/* ============================================================
+   PROGRAMS — multi-week guided plans. Each day is shaped exactly
+   like a Template (config + buildItems + burnoutItems), which
+   means the exact same instantiateTemplate() function that turns
+   a Template into a real Builder session also works here — no
+   separate engine needed. The same weekly pattern repeats for the
+   program's full duration; progressionNote is shown as guidance
+   rather than mechanically changing the workout.
+   day: 0=Sunday .. 6=Saturday, matching JS Date.getDay().
+   ============================================================ */
+const PROGRAMS = [
+  {
+    id: "program_weight_loss",
+    name: "Weight Loss",
+    goal: "Weight Loss",
+    color: C.amber,
+    durationWeeks: 4,
+    description: "Full-body HIIT and conditioning circuits to maximize calorie burn, with active recovery built in.",
+    progressionNote: "Weeks 3–4: add one extra round to each circuit once the pace starts to feel manageable.",
+    days: [
+      { day: 0, type: "rest" },
+      {
+        day: 1, type: "workout", label: "Full Body HIIT",
+        config: { mode: "Timer", work: 30, rest: 15, rounds: 4, targetReps: 12, rotationMode: "Circuit", circuitTransition: 10 },
+        buildItems: [{ exerciseId: "ex7" }, { exerciseId: "ex9" }, { exerciseId: "ex32" }, { exerciseId: "ex40" }],
+        burnoutItems: [],
+      },
+      {
+        day: 2, type: "workout", label: "Active Recovery",
+        config: { mode: "Sequence", rounds: 1 },
+        buildItems: [{ exerciseId: "ex35" }, { exerciseId: "ex8" }, { exerciseId: "ex37" }, { exerciseId: "ex36" }],
+        burnoutItems: [],
+      },
+      {
+        day: 3, type: "workout", label: "Lower Body Circuit",
+        config: { mode: "Timer", work: 30, rest: 15, rounds: 3, targetReps: 15, rotationMode: "Circuit", circuitTransition: 10 },
+        buildItems: [{ exerciseId: "ex33" }, { exerciseId: "ex24" }, { exerciseId: "ex34" }, { exerciseId: "ex9" }],
+        burnoutItems: [],
+      },
+      { day: 4, type: "rest" },
+      {
+        day: 5, type: "workout", label: "Upper Body + Core",
+        config: { mode: "Timer", work: 40, rest: 20, rounds: 3, targetReps: 12 },
+        buildItems: [{ exerciseId: "ex11" }, { exerciseId: "ex15" }, { exerciseId: "ex6" }, { exerciseId: "ex29" }],
+        burnoutItems: [],
+      },
+      {
+        day: 6, type: "workout", label: "HIIT Circuit",
+        config: { mode: "Timer", work: 20, rest: 10, rounds: 4, targetReps: 15, rotationMode: "Circuit", circuitTransition: 8 },
+        buildItems: [{ exerciseId: "ex7" }, { exerciseId: "ex32" }, { exerciseId: "ex50" }, { exerciseId: "ex33" }],
+        burnoutItems: [],
+      },
+    ],
+  },
+  {
+    id: "program_full_body_strength",
+    name: "Full Body Strength",
+    goal: "Strength",
+    color: C.blue,
+    durationWeeks: 4,
+    description: "Classic push/pull/legs split with real rest days — build strength without burning out.",
+    progressionNote: "Weeks 3–4: add 5–10 lbs to your main lifts if last week felt manageable at RPE 7 or below.",
+    days: [
+      { day: 0, type: "rest" },
+      {
+        day: 1, type: "workout", label: "Push",
+        config: { mode: "Reps", work: 40, rest: 25, rounds: 3, targetReps: 10 },
+        buildItems: [{ exerciseId: "ex1" }, { exerciseId: "ex3" }, { exerciseId: "ex12" }, { exerciseId: "ex21" }],
+        burnoutItems: [{ exerciseId: "ex14" }],
+      },
+      {
+        day: 2, type: "workout", label: "Pull",
+        config: { mode: "Reps", work: 40, rest: 25, rounds: 4, targetReps: 8 },
+        buildItems: [{ exerciseId: "ex2" }, { exerciseId: "ex15" }, { exerciseId: "ex16" }, { exerciseId: "ex56" }],
+        burnoutItems: [],
+      },
+      { day: 3, type: "rest" },
+      {
+        day: 4, type: "workout", label: "Legs",
+        config: { mode: "Timer", work: 45, rest: 45, rounds: 4, targetReps: 6 },
+        buildItems: [{ exerciseId: "ex5" }, { exerciseId: "ex10" }, { exerciseId: "ex25" }, { exerciseId: "ex26" }],
+        burnoutItems: [{ exerciseId: "ex27" }],
+      },
+      {
+        day: 5, type: "workout", label: "Full Body Accessory",
+        config: { mode: "Reps", work: 40, rest: 20, rounds: 3, targetReps: 12 },
+        buildItems: [{ exerciseId: "ex58" }, { exerciseId: "ex51" }, { exerciseId: "ex20" }, { exerciseId: "ex27" }],
+        burnoutItems: [],
+      },
+      { day: 6, type: "rest" },
+    ],
+  },
+  {
+    id: "program_athletic",
+    name: "Athletic Performance",
+    goal: "Athletics",
+    color: "#8B5CF6",
+    durationWeeks: 4,
+    description: "Power, speed, and conditioning work modeled on how athletes actually train — with real mobility days.",
+    progressionNote: "Weeks 3–4: push for slightly more explosive effort on Power and Speed days — quality over fatigue.",
+    days: [
+      { day: 0, type: "rest" },
+      {
+        day: 1, type: "workout", label: "Power",
+        config: { mode: "Timer", work: 20, rest: 40, rounds: 4, targetReps: 8, rotationMode: "Circuit", circuitTransition: 15 },
+        buildItems: [{ exerciseId: "ex46" }, { exerciseId: "ex34" }, { exerciseId: "ex48" }, { exerciseId: "ex9" }],
+        burnoutItems: [],
+      },
+      {
+        day: 2, type: "workout", label: "Speed & Agility",
+        config: { mode: "Timer", work: 20, rest: 20, rounds: 4, targetReps: 15, rotationMode: "Circuit", circuitTransition: 10 },
+        buildItems: [{ exerciseId: "ex47" }, { exerciseId: "ex50" }, { exerciseId: "ex32" }, { exerciseId: "ex7" }],
+        burnoutItems: [],
+      },
+      {
+        day: 3, type: "workout", label: "Mobility",
+        config: { mode: "Sequence", rounds: 1 },
+        buildItems: [{ exerciseId: "ex41" }, { exerciseId: "ex43" }, { exerciseId: "ex42" }, { exerciseId: "ex36" }],
+        burnoutItems: [],
+      },
+      {
+        day: 4, type: "workout", label: "Strength",
+        config: { mode: "Timer", work: 45, rest: 45, rounds: 3, targetReps: 6 },
+        buildItems: [{ exerciseId: "ex5" }, { exerciseId: "ex10" }, { exerciseId: "ex26" }, { exerciseId: "ex57" }],
+        burnoutItems: [],
+      },
+      {
+        day: 5, type: "workout", label: "Conditioning",
+        config: { mode: "Timer", work: 30, rest: 15, rounds: 4, targetReps: 15, rotationMode: "Circuit", circuitTransition: 10 },
+        buildItems: [{ exerciseId: "ex60" }, { exerciseId: "ex59" }, { exerciseId: "ex9" }, { exerciseId: "ex7" }],
+        burnoutItems: [],
+      },
+      {
+        day: 6, type: "workout", label: "Active Recovery",
+        config: { mode: "Sequence", rounds: 1 },
+        buildItems: [{ exerciseId: "ex8" }, { exerciseId: "ex35" }, { exerciseId: "ex44" }, { exerciseId: "ex45" }],
+        burnoutItems: [],
+      },
+    ],
+  },
+  {
+    id: "program_recovery",
+    name: "Recovery & Mobility",
+    goal: "Recovery",
+    color: "#16A34A",
+    durationWeeks: 4,
+    description: "Low-intensity mobility and light full-body work — for deloads, injury recovery, or just a reset.",
+    progressionNote: "This program isn't meant to progress in intensity — the goal is consistency, not overload.",
+    days: [
+      { day: 0, type: "rest" },
+      {
+        day: 1, type: "workout", label: "Mobility Flow",
+        config: { mode: "Sequence", rounds: 1 },
+        buildItems: [{ exerciseId: "ex8" }, { exerciseId: "ex35" }, { exerciseId: "ex45" }, { exerciseId: "ex43" }],
+        burnoutItems: [],
+      },
+      {
+        day: 2, type: "workout", label: "Light Core",
+        config: { mode: "Reps", work: 30, rest: 30, rounds: 2, targetReps: 10 },
+        buildItems: [{ exerciseId: "ex6" }, { exerciseId: "ex29" }, { exerciseId: "ex31" }],
+        burnoutItems: [],
+      },
+      { day: 3, type: "rest" },
+      {
+        day: 4, type: "workout", label: "Mobility Flow",
+        config: { mode: "Sequence", rounds: 1 },
+        buildItems: [{ exerciseId: "ex41" }, { exerciseId: "ex37" }, { exerciseId: "ex44" }, { exerciseId: "ex42" }],
+        burnoutItems: [],
+      },
+      {
+        day: 5, type: "workout", label: "Light Full Body",
+        config: { mode: "Reps", work: 30, rest: 30, rounds: 2, targetReps: 10 },
+        buildItems: [{ exerciseId: "ex11" }, { exerciseId: "ex24" }, { exerciseId: "ex6" }],
+        burnoutItems: [],
+      },
+      { day: 6, type: "rest" },
+    ],
+  },
+];
+
+function getTodayProgramDay(activeProgramRow) {
+  if (!activeProgramRow) return null;
+  const program = PROGRAMS.find((p) => p.id === activeProgramRow.program_id);
+  if (!program) return null;
+  const startDay = new Date(activeProgramRow.started_at);
+  startDay.setHours(0, 0, 0, 0);
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const daysSinceStart = Math.round((today.getTime() - startDay.getTime()) / 86400000);
+  const totalDays = program.durationWeeks * 7;
+  if (daysSinceStart >= totalDays) return { program, complete: true };
+  const currentWeek = Math.floor(daysSinceStart / 7) + 1;
+  const dayDef = program.days.find((d) => d.day === today.getDay());
+  return { program, week: currentWeek, dayDef, complete: false };
+}
 
 function serializeTemplate(name, buildList, burnoutList, config) {
   const groupIds = {};
@@ -1026,6 +1290,21 @@ async function deleteCloudSet(token, setId) {
 async function deleteCloudSession(token, sessionId) {
   // sets cascade-delete automatically via the existing foreign key
   await supabaseRest(`sessions?id=eq.${sessionId}`, { method: "DELETE", token });
+}
+
+async function fetchActiveProgram(token) {
+  const rows = await supabaseRest("user_programs?select=*&order=started_at.desc&limit=1", { token });
+  return rows?.[0] || null;
+}
+
+async function startCloudProgram(token, userId, programId) {
+  await supabaseRest(`user_programs?user_id=eq.${userId}`, { method: "DELETE", token });
+  const [row] = await supabaseRest("user_programs", { method: "POST", token, body: { user_id: userId, program_id: programId, started_at: new Date().toISOString() } });
+  return row;
+}
+
+async function cancelCloudProgram(token, userId) {
+  await supabaseRest(`user_programs?user_id=eq.${userId}`, { method: "DELETE", token });
 }
 
 async function fetchCloudTemplates(token) {
@@ -5360,6 +5639,143 @@ function OnboardingTutorialScreen({ onDone }) {
 }
 
 
+/* ============================================================
+   PROGRAMS SCREEN — browse guided multi-week plans, start one,
+   or check in on the one you're already running
+   ============================================================ */
+const DAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+function ProgramsScreen({ activeProgramRow, onBack, onStartProgram, onCancelProgram, onStartTodayWorkout }) {
+  const [viewing, setViewing] = useState(null); // a program being previewed
+  const [confirmingCancel, setConfirmingCancel] = useState(false);
+
+  const activeProgram = activeProgramRow ? PROGRAMS.find((p) => p.id === activeProgramRow.program_id) : null;
+  const todayInfo = activeProgramRow ? getTodayProgramDay(activeProgramRow) : null;
+
+  if (viewing) {
+    const p = viewing;
+    return (
+      <div style={{ minHeight: "100vh", background: C.bg, paddingBottom: 30 }}>
+        <FontImport />
+        <div style={{ padding: "22px 20px 6px", display: "flex", alignItems: "center", gap: 12 }}>
+          <button onClick={() => setViewing(null)} style={{ background: "none", border: "none" }}>
+            <ArrowLeft size={20} color={C.textLo} />
+          </button>
+          <h1 className="fg-display" style={{ color: C.textHi, fontSize: 22, fontWeight: 700, margin: 0 }}>{p.name}</h1>
+        </div>
+        <div style={{ padding: "12px 20px 0" }}>
+          <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
+            <Chip label={p.goal} active color={p.color} />
+            <Chip label={`${p.durationWeeks} weeks`} active color={C.textLo} />
+          </div>
+          <div className="fg-mono" style={{ color: C.textLo, fontSize: 13, lineHeight: 1.6, marginBottom: 20 }}>{p.description}</div>
+
+          <div className="fg-mono" style={{ color: C.textLo, fontSize: 12, letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 10 }}>Weekly Schedule</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 20 }}>
+            {[1, 2, 3, 4, 5, 6, 0].map((dayNum) => {
+              const d = p.days.find((x) => x.day === dayNum);
+              const isRest = !d || d.type === "rest";
+              return (
+                <div key={dayNum} style={{ display: "flex", alignItems: "center", gap: 12, padding: "11px 14px", borderRadius: 10, background: isRest ? "transparent" : C.bgCard, border: `1px solid ${isRest ? C.line : p.color + "44"}` }}>
+                  <span className="fg-mono" style={{ color: C.textLo, fontSize: 11, width: 34 }}>{DAY_NAMES[dayNum]}</span>
+                  <span className="fg-display" style={{ color: isRest ? C.textLo : C.textHi, fontSize: 15, fontWeight: 600 }}>{isRest ? "Rest" : d.label}</span>
+                </div>
+              );
+            })}
+          </div>
+
+          <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, lineHeight: 1.6, marginBottom: 22, padding: "12px 14px", background: C.bgCard, border: `1px solid ${C.line}`, borderRadius: 10 }}>
+            <span style={{ color: C.accent }}>Progression: </span>{p.progressionNote}
+          </div>
+
+          <button
+            onClick={() => { onStartProgram(p.id); setViewing(null); }}
+            className="fg-display"
+            style={{ width: "100%", background: p.color, border: "none", borderRadius: 14, padding: "16px", color: "white", fontWeight: 700, fontSize: 16 }}
+          >
+            Start This Program
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ minHeight: "100vh", background: C.bg, paddingBottom: 30 }}>
+      <FontImport />
+      <div style={{ padding: "22px 20px 10px", display: "flex", alignItems: "center", gap: 12 }}>
+        <button onClick={onBack} style={{ background: "none", border: "none" }}>
+          <ArrowLeft size={20} color={C.textLo} />
+        </button>
+        <h1 className="fg-display" style={{ color: C.textHi, fontSize: 26, fontWeight: 700, margin: 0 }}>Programs</h1>
+      </div>
+
+      <div style={{ padding: "10px 20px 0" }}>
+        {activeProgram && todayInfo && (
+          <div style={{ background: `${activeProgram.color}14`, border: `1px solid ${activeProgram.color}`, borderRadius: 14, padding: 16, marginBottom: 22 }}>
+            <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: 6 }}>Currently Running</div>
+            <div className="fg-display" style={{ color: C.textHi, fontSize: 20, fontWeight: 700, marginBottom: 4 }}>{activeProgram.name}</div>
+            {todayInfo.complete ? (
+              <div className="fg-mono" style={{ color: C.textLo, fontSize: 13, marginBottom: 14 }}>
+                You've completed all {activeProgram.durationWeeks} weeks — nice work. Start it again or pick a new program.
+              </div>
+            ) : (
+              <div className="fg-mono" style={{ color: C.textLo, fontSize: 13, marginBottom: 14 }}>
+                Week {todayInfo.week} of {activeProgram.durationWeeks} · Today: {todayInfo.dayDef?.type === "rest" || !todayInfo.dayDef ? "Rest Day" : todayInfo.dayDef.label}
+              </div>
+            )}
+            <div style={{ display: "flex", gap: 8 }}>
+              {!todayInfo.complete && todayInfo.dayDef && todayInfo.dayDef.type === "workout" && (
+                <button
+                  onClick={() => onStartTodayWorkout(todayInfo.dayDef)}
+                  className="fg-display"
+                  style={{ flex: 1, background: activeProgram.color, border: "none", borderRadius: 10, padding: "12px", color: "white", fontWeight: 700, fontSize: 14 }}
+                >
+                  Start Today's Workout
+                </button>
+              )}
+              {confirmingCancel ? (
+                <>
+                  <button onClick={() => setConfirmingCancel(false)} className="fg-display" style={{ flex: 1, background: "transparent", border: `1px solid ${C.line}`, borderRadius: 10, padding: "12px", color: C.textLo, fontWeight: 600, fontSize: 13 }}>Cancel</button>
+                  <button onClick={() => { onCancelProgram(); setConfirmingCancel(false); }} className="fg-display" style={{ flex: 1, background: "#EF4444", border: "none", borderRadius: 10, padding: "12px", color: "white", fontWeight: 700, fontSize: 13 }}>Confirm End</button>
+                </>
+              ) : (
+                <button onClick={() => setConfirmingCancel(true)} className="fg-display" style={{ background: "transparent", border: `1px solid ${C.line}`, borderRadius: 10, padding: "12px 16px", color: C.textLo, fontWeight: 600, fontSize: 13 }}>
+                  End Program
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+
+        <div className="fg-mono" style={{ color: C.textLo, fontSize: 12, letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 12 }}>
+          {activeProgram ? "Other Programs" : "Choose a Program"}
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          {PROGRAMS.filter((p) => p.id !== activeProgram?.id).map((p) => (
+            <div
+              key={p.id}
+              onClick={() => setViewing(p)}
+              style={{ background: C.bgCard, border: `1px solid ${C.line}`, borderRadius: 14, padding: 16, cursor: "pointer" }}
+            >
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 6 }}>
+                <div className="fg-display" style={{ color: C.textHi, fontSize: 18, fontWeight: 700 }}>{p.name}</div>
+                <ChevronRight size={16} color={C.textLo} />
+              </div>
+              <div className="fg-mono" style={{ color: C.textLo, fontSize: 12, marginBottom: 10, lineHeight: 1.5 }}>{p.description}</div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <Chip label={p.goal} active color={p.color} />
+                <Chip label={`${p.durationWeeks} weeks`} active color={C.textLo} />
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
 function AppLoadingScreen() {
   return (
     <div style={{ minHeight: "100vh", background: C.bg, display: "flex", alignItems: "center", justifyContent: "center" }}>
@@ -5379,6 +5795,7 @@ export default function App() {
   const [hydrated, setHydrated] = useState(false);
   const [cloudError, setCloudError] = useState("");
   const [needsOnboarding, setNeedsOnboarding] = useState(false);
+  const [activeProgramRow, setActiveProgramRow] = useState(null);
 
   const user = authSession ? { id: authSession.user.id, name: authSession.user.name || authSession.user.email.split("@")[0], email: authSession.user.email } : null;
 
@@ -5420,14 +5837,16 @@ export default function App() {
         if (token) {
           setAuthSession((s) => s || stored);
           try {
-            const [cloudHistory, cloudTemplates, onboarded] = await Promise.all([
+            const [cloudHistory, cloudTemplates, onboarded, program] = await Promise.all([
               fetchCloudHistory(token),
               fetchCloudTemplates(token),
               fetchHasOnboarded(token, stored.user.id),
+              fetchActiveProgram(token),
             ]);
             setHistory(cloudHistory);
             setTemplates([...PRESET_TEMPLATES, ...cloudTemplates]);
             setNeedsOnboarding(!onboarded);
+            setActiveProgramRow(program);
           } catch (e) {
             setCloudError("Couldn't reach the server — showing what's cached locally.");
           }
@@ -5445,14 +5864,16 @@ export default function App() {
   const handleAuthed = async (newSession) => {
     setAuthSession(newSession);
     try {
-      const [cloudHistory, cloudTemplates, onboarded] = await Promise.all([
+      const [cloudHistory, cloudTemplates, onboarded, program] = await Promise.all([
         fetchCloudHistory(newSession.access_token),
         fetchCloudTemplates(newSession.access_token),
         fetchHasOnboarded(newSession.access_token, newSession.user.id),
+        fetchActiveProgram(newSession.access_token),
       ]);
       setHistory(cloudHistory);
       setTemplates([...PRESET_TEMPLATES, ...cloudTemplates]);
       setNeedsOnboarding(!onboarded);
+      setActiveProgramRow(program);
     } catch (e) {
       setCloudError("Signed in, but couldn't load your data from the server yet.");
     }
@@ -5463,6 +5884,7 @@ export default function App() {
     setHistory([]);
     setTemplates(PRESET_TEMPLATES);
     setNeedsOnboarding(false);
+    setActiveProgramRow(null);
     setView("home");
   };
 
@@ -5530,6 +5952,35 @@ export default function App() {
 
   const loadTemplate = (tpl) => {
     setPendingTemplate(instantiateTemplate(tpl));
+    setView("builder");
+  };
+
+  const startProgram = async (programId) => {
+    const optimisticRow = { program_id: programId, started_at: new Date().toISOString() };
+    setActiveProgramRow(optimisticRow); // optimistic
+    try {
+      const token = await getValidToken(authSession, setAuthSession);
+      if (!token) throw new Error("Not signed in");
+      const saved = await startCloudProgram(token, authSession.user.id, programId);
+      setActiveProgramRow(saved);
+    } catch (e) {
+      setCloudError("Started locally, but couldn't sync to the server.");
+    }
+  };
+
+  const cancelProgram = async () => {
+    setActiveProgramRow(null); // optimistic
+    try {
+      const token = await getValidToken(authSession, setAuthSession);
+      if (!token) throw new Error("Not signed in");
+      await cancelCloudProgram(token, authSession.user.id);
+    } catch (e) {
+      setCloudError("Ended locally, but couldn't sync to the server.");
+    }
+  };
+
+  const startTodayWorkout = (dayDef) => {
+    setPendingTemplate(instantiateTemplate({ config: dayDef.config, buildItems: dayDef.buildItems, burnoutItems: dayDef.burnoutItems || [] }));
     setView("builder");
   };
 
@@ -5620,6 +6071,16 @@ export default function App() {
         onSaveTemplate={saveTemplate}
       />
     );
+  } else if (view === "programs") {
+    screen = (
+      <ProgramsScreen
+        activeProgramRow={activeProgramRow}
+        onBack={() => setView("home")}
+        onStartProgram={startProgram}
+        onCancelProgram={cancelProgram}
+        onStartTodayWorkout={startTodayWorkout}
+      />
+    );
   } else if (view === "social") {
     screen = (
       <SocialScreen
@@ -5673,11 +6134,14 @@ export default function App() {
         history={history}
         templates={templates}
         squadMembers={squadMembers}
+        activeProgramRow={activeProgramRow}
         onStartBuild={startBuilderEmpty}
         onLoadTemplate={loadTemplate}
         onStartFreestyle={() => setView("freestyle")}
         onOpenHistory={() => setView("history")}
         onOpenSocial={() => setView("social")}
+        onOpenPrograms={() => setView("programs")}
+        onStartTodayWorkout={startTodayWorkout}
       />
     );
   }
