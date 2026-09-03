@@ -408,7 +408,7 @@ function HomeScreen({ user, history, templates, squadMembers, onStartBuild, onLo
     name: s.source === "freestyle" ? "Freestyle Session" : `${s.mode} Workout`,
     when: relativeDay(s.date),
     sets: s.sets.length,
-    duration: `${Math.round(s.durationSec / 60)} min`,
+    duration: s.durationSec ? `${Math.round(s.durationSec / 60)} min` : "duration unknown",
   }));
 
   const sectionLabel = (text) => (
@@ -928,6 +928,7 @@ function dbSessionToRecord(row) {
     mode: row.mode,
     durationSec: row.duration_sec,
     sets: (row.sets || []).map((s) => ({
+      id: s.id,
       exerciseId: s.exercise_id,
       exerciseName: s.exercises?.name || exById(s.exercise_id)?.name || "Exercise",
       setNumber: s.set_number,
@@ -999,10 +1000,32 @@ async function fetchCloudHistory(token) {
 async function insertCloudSession(token, userId, record) {
   const { session, sets } = sessionRecordToDbPayload(record, userId);
   const [insertedSession] = await supabaseRest("sessions", { method: "POST", token, body: session });
+  let insertedSets = [];
   if (sets.length) {
-    await supabaseRest("sets", { method: "POST", token, body: sets.map((s) => ({ ...s, session_id: insertedSession.id })) });
+    insertedSets = await supabaseRest("sets", { method: "POST", token, body: sets.map((s) => ({ ...s, session_id: insertedSession.id })) });
   }
-  return dbSessionToRecord({ ...insertedSession, sets: record.sets.map((s) => ({ ...s, exercises: { name: s.exerciseName } })) });
+  // PostgREST returns bulk-inserted rows in the same order submitted — match them
+  // back up positionally so each set carries its real id (needed to edit/delete later).
+  const setsWithNames = (insertedSets || []).map((s, i) => ({ ...s, exercises: { name: record.sets[i]?.exerciseName } }));
+  return dbSessionToRecord({ ...insertedSession, sets: setsWithNames });
+}
+
+async function updateCloudSet(token, setId, patch) {
+  const dbPatch = {};
+  if ("reps" in patch) dbPatch.reps = patch.reps;
+  if ("weight" in patch) dbPatch.weight = patch.weight;
+  if ("weightType" in patch) dbPatch.weight_type = patch.weightType;
+  if ("rpe" in patch) dbPatch.rpe = patch.rpe;
+  await supabaseRest(`sets?id=eq.${setId}`, { method: "PATCH", token, body: dbPatch });
+}
+
+async function deleteCloudSet(token, setId) {
+  await supabaseRest(`sets?id=eq.${setId}`, { method: "DELETE", token });
+}
+
+async function deleteCloudSession(token, sessionId) {
+  // sets cascade-delete automatically via the existing foreign key
+  await supabaseRest(`sessions?id=eq.${sessionId}`, { method: "DELETE", token });
 }
 
 async function fetchCloudTemplates(token) {
@@ -3835,14 +3858,26 @@ function useHistoryData(liveHistory) {
 /* ============================================================
    HISTORY SCREEN
    ============================================================ */
-function HistoryScreen({ liveHistory, onBack }) {
+function HistoryScreen({ liveHistory, onBack, onSaveSession, onUpdateSet, onDeleteSet, onDeleteSession }) {
   const [tab, setTab] = useState("Log");
   const [expandedSession, setExpandedSession] = useState(null);
   const [progressExercise, setProgressExercise] = useState(null);
   const [progressMetric, setProgressMetric] = useState("Est 1RM");
+  const [editingSet, setEditingSet] = useState(null); // { sessionId, set }
+  const [confirmingDeleteId, setConfirmingDeleteId] = useState(null);
+  const [backfilling, setBackfilling] = useState(false);
 
   const data = useHistoryData(liveHistory);
   const { sessions, allSets, totalSessions, totalSets, totalVolume, streak, muscleCounts, exerciseNames, prs } = data;
+
+  if (backfilling) {
+    return (
+      <BackfillWorkoutScreen
+        onCancel={() => setBackfilling(false)}
+        onSave={(record) => { onSaveSession(record); setBackfilling(false); }}
+      />
+    );
+  }
 
   const selectedExercise = progressExercise || exerciseNames[0];
 
@@ -3978,6 +4013,18 @@ function HistoryScreen({ liveHistory, onBack }) {
             ))}
           </div>
 
+          <button
+            onClick={() => setBackfilling(true)}
+            className="fg-display"
+            style={{
+              width: "100%", background: `${C.blue}1A`, border: `1px solid ${C.blue}`, borderRadius: 12,
+              padding: "13px", color: C.accent, fontWeight: 700, fontSize: 14, marginBottom: 20,
+              display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
+            }}
+          >
+            <Plus size={16} /> Log a Past Workout
+          </button>
+
           <div className="fg-mono" style={{ color: C.textLo, fontSize: 12, letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 10 }}>
             Sessions
           </div>
@@ -3985,24 +4032,41 @@ function HistoryScreen({ liveHistory, onBack }) {
             {sessions.map((s) => {
               const exCount = new Set(s.sets.map((x) => x.exerciseId)).size;
               const expanded = expandedSession === s.id;
+              const confirmingDelete = confirmingDeleteId === s.id;
               return (
-                <div key={s.id} style={{ background: C.bgCard, border: `1px solid ${C.line}`, borderRadius: 12, overflow: "hidden" }}>
-                  <div
-                    onClick={() => setExpandedSession(expanded ? null : s.id)}
-                    style={{ padding: "13px 14px", display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer" }}
-                  >
-                    <div>
-                      <div className="fg-display" style={{ color: C.textHi, fontSize: 16, fontWeight: 600 }}>
-                        {new Date(s.date).toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" })}
-                        <span className="fg-mono" style={{ color: C.textLo, fontSize: 11, marginLeft: 8 }}>{s.mode}</span>
-                      </div>
-                      <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, marginTop: 2 }}>
-                        {exCount} exercises · {s.sets.length} sets · {Math.round(s.durationSec / 60)} min
+                <div key={s.id} style={{ background: C.bgCard, border: `1px solid ${confirmingDelete ? "#EF4444" : C.line}`, borderRadius: 12, overflow: "hidden" }}>
+                  {confirmingDelete ? (
+                    <div style={{ padding: "13px 14px", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+                      <span className="fg-mono" style={{ color: "#F87171", fontSize: 13 }}>Delete this whole session?</span>
+                      <div style={{ display: "flex", gap: 8 }}>
+                        <button onClick={() => setConfirmingDeleteId(null)} className="fg-display" style={{ background: "transparent", border: `1px solid ${C.line}`, borderRadius: 8, padding: "7px 12px", color: C.textLo, fontSize: 12, fontWeight: 600 }}>
+                          Cancel
+                        </button>
+                        <button onClick={() => { onDeleteSession(s.id); setConfirmingDeleteId(null); }} className="fg-display" style={{ background: "#EF4444", border: "none", borderRadius: 8, padding: "7px 12px", color: "white", fontSize: 12, fontWeight: 700 }}>
+                          Delete
+                        </button>
                       </div>
                     </div>
-                    <ChevronRight size={16} color={C.textLo} style={{ transform: expanded ? "rotate(90deg)" : "none", transition: "transform 0.2s" }} />
-                  </div>
-                  {expanded && (
+                  ) : (
+                    <div style={{ padding: "13px 14px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                      <div onClick={() => setExpandedSession(expanded ? null : s.id)} style={{ cursor: "pointer", flex: 1 }}>
+                        <div className="fg-display" style={{ color: C.textHi, fontSize: 16, fontWeight: 600 }}>
+                          {new Date(s.date).toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" })}
+                          <span className="fg-mono" style={{ color: C.textLo, fontSize: 11, marginLeft: 8 }}>{s.mode}</span>
+                        </div>
+                        <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, marginTop: 2 }}>
+                          {exCount} exercises · {s.sets.length} sets · {s.durationSec ? `${Math.round(s.durationSec / 60)} min` : "duration unknown"}
+                        </div>
+                      </div>
+                      <button onClick={() => setConfirmingDeleteId(s.id)} style={{ background: "none", border: "none", padding: 6 }}>
+                        <X size={15} color={C.textLo} />
+                      </button>
+                      <div onClick={() => setExpandedSession(expanded ? null : s.id)} style={{ cursor: "pointer", padding: 4 }}>
+                        <ChevronRight size={16} color={C.textLo} style={{ transform: expanded ? "rotate(90deg)" : "none", transition: "transform 0.2s" }} />
+                      </div>
+                    </div>
+                  )}
+                  {expanded && !confirmingDelete && (
                     <div style={{ padding: "0 14px 14px" }}>
                       {Object.entries(
                         s.sets.reduce((acc, set) => {
@@ -4013,8 +4077,14 @@ function HistoryScreen({ liveHistory, onBack }) {
                         <div key={name} style={{ marginBottom: 10 }}>
                           <div className="fg-display" style={{ color: C.textHi, fontSize: 14, fontWeight: 600, marginBottom: 4 }}>{name}</div>
                           {sets.map((set, i) => (
-                            <div key={i} className="fg-mono" style={{ color: C.textLo, fontSize: 11, marginBottom: 2 }}>
-                              Set {set.setNumber || i + 1}: {set.reps || "—"} reps{set.weight ? ` · ${set.weight} lbs (${set.weightType || "Other"})` : ""}{set.rpe ? ` · RPE ${set.rpe}` : ""}
+                            <div
+                              key={set.id ?? i}
+                              onClick={() => set.id && setEditingSet({ sessionId: s.id, set })}
+                              className="fg-mono"
+                              style={{ color: C.textLo, fontSize: 11, marginBottom: 2, display: "flex", alignItems: "center", gap: 6, cursor: set.id ? "pointer" : "default" }}
+                            >
+                              <span>Set {set.setNumber || i + 1}: {set.reps || "—"} reps{set.weight ? ` · ${set.weight} lbs (${set.weightType || "Other"})` : ""}{set.rpe ? ` · RPE ${set.rpe}` : ""}</span>
+                              {set.id && <MoreHorizontal size={12} color={C.textLo} />}
                             </div>
                           ))}
                         </div>
@@ -4194,6 +4264,234 @@ function HistoryScreen({ liveHistory, onBack }) {
             Blue = You · Purple = Jess
           </div>
         </div>
+      )}
+
+      {editingSet && (
+        <SetEditSheet
+          set={editingSet.set}
+          onClose={() => setEditingSet(null)}
+          onSave={(patch) => { onUpdateSet(editingSet.sessionId, editingSet.set.id, patch); setEditingSet(null); }}
+          onDelete={() => { onDeleteSet(editingSet.sessionId, editingSet.set.id); setEditingSet(null); }}
+        />
+      )}
+    </div>
+  );
+}
+
+/* ============================================================
+   SET EDIT SHEET — edit or delete a single already-logged set
+   ============================================================ */
+function SetEditSheet({ set, onClose, onSave, onDelete }) {
+  const [reps, setReps] = useState(set.reps || 0);
+  const [weight, setWeight] = useState(set.weight || 0);
+  const [weightType, setWeightType] = useState(set.weightType || "Other");
+  const [rpe, setRpe] = useState(set.rpe || null);
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 80, display: "flex", alignItems: "flex-end" }} onClick={onClose}>
+      <div onClick={(e) => e.stopPropagation()} style={{ width: "100%", background: C.bgRaised, borderTop: `1px solid ${C.line}`, borderRadius: "20px 20px 0 0", padding: 22, maxHeight: "85vh", overflowY: "auto" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+          <div className="fg-display" style={{ color: C.textHi, fontSize: 20, fontWeight: 700 }}>Edit Set</div>
+          <button onClick={onClose} style={{ background: "none", border: "none" }}>
+            <X size={20} color={C.textLo} />
+          </button>
+        </div>
+        <div className="fg-display" style={{ color: C.textHi, fontSize: 16, fontWeight: 600, marginBottom: 18 }}>{set.exerciseName}</div>
+
+        <div style={{ marginBottom: 14 }}>
+          <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, letterSpacing: "0.08em", marginBottom: 8 }}>REPS</div>
+          <DialInput value={reps} onChange={setReps} min={0} max={100} step={1} unit="" />
+        </div>
+        <div style={{ marginBottom: 16 }}>
+          <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, letterSpacing: "0.08em", marginBottom: 8 }}>WEIGHT (LBS)</div>
+          <DialInput value={weight} onChange={setWeight} min={0} max={999} step={5} unit=" lbs" />
+        </div>
+
+        <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, letterSpacing: "0.08em", marginBottom: 10 }}>WEIGHT TYPE</div>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 20 }}>
+          {WEIGHT_TYPES.map((w) => (
+            <Chip key={w} label={w} active={weightType === w} onClick={() => setWeightType(w)} />
+          ))}
+        </div>
+
+        <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, letterSpacing: "0.08em", marginBottom: 10 }}>RPE</div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 8, marginBottom: 22 }}>
+          {Array.from({ length: 10 }).map((_, i) => {
+            const v = i + 1;
+            return (
+              <button key={v} onClick={() => setRpe(v)} className="fg-mono"
+                style={{ padding: "13px 0", borderRadius: 9, border: `1px solid ${rpe === v ? C.blue : C.line}`, background: rpe === v ? `${C.blue}33` : "transparent", color: rpe === v ? C.accent : C.textLo, fontSize: 14, fontWeight: 600 }}>
+                {v}
+              </button>
+            );
+          })}
+        </div>
+
+        <button
+          onClick={() => onSave({ reps: reps || null, weight: weight || null, weightType: weight ? weightType : null, rpe })}
+          className="fg-display"
+          style={{ width: "100%", background: C.blue, border: "none", borderRadius: 12, padding: "16px", color: "white", fontWeight: 700, fontSize: 16, marginBottom: 10 }}
+        >
+          Save Changes
+        </button>
+
+        {confirmingDelete ? (
+          <div style={{ display: "flex", gap: 8 }}>
+            <button onClick={() => setConfirmingDelete(false)} className="fg-display" style={{ flex: 1, background: "transparent", border: `1px solid ${C.line}`, borderRadius: 12, padding: "13px", color: C.textLo, fontWeight: 600, fontSize: 14 }}>
+              Cancel
+            </button>
+            <button onClick={onDelete} className="fg-display" style={{ flex: 1, background: "#EF4444", border: "none", borderRadius: 12, padding: "13px", color: "white", fontWeight: 700, fontSize: 14 }}>
+              Confirm Delete
+            </button>
+          </div>
+        ) : (
+          <button
+            onClick={() => setConfirmingDelete(true)}
+            className="fg-display"
+            style={{ width: "100%", background: "transparent", border: `1px solid #EF4444`, borderRadius: 12, padding: "13px", color: "#EF4444", fontWeight: 600, fontSize: 14 }}
+          >
+            Delete This Set
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   BACKFILL WORKOUT — log a full past workout that wasn't
+   captured live, with a real editable date instead of a live timer
+   ============================================================ */
+function BackfillWorkoutScreen({ onCancel, onSave }) {
+  const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [log, setLog] = useState([]);
+  const [picking, setPicking] = useState(false);
+  const [logging, setLogging] = useState(null);
+  const [query, setQuery] = useState("");
+
+  const filtered = EXERCISES.filter((ex) => ex.name.toLowerCase().includes(query.toLowerCase()));
+
+  const handleSave = () => {
+    const [y, m, d] = date.split("-").map(Number);
+    const chosenDate = new Date(y, m - 1, d, 12, 0, 0).getTime();
+    onSave({
+      id: `backfill_${Date.now()}`,
+      date: chosenDate,
+      source: "backfill",
+      mode: "Backfill",
+      durationSec: 0,
+      sets: log,
+    });
+  };
+
+  return (
+    <div style={{ minHeight: "100vh", background: C.bg, paddingBottom: 100 }}>
+      <FontImport />
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "20px 20px 6px" }}>
+        <button onClick={onCancel} style={{ background: "none", border: "none" }}>
+          <X size={22} color={C.textLo} />
+        </button>
+        <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, letterSpacing: "0.1em", textTransform: "uppercase" }}>
+          Log a Past Workout
+        </div>
+        <div style={{ width: 22 }} />
+      </div>
+
+      <div style={{ padding: "14px 20px 0" }}>
+        <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, letterSpacing: "0.08em", marginBottom: 8 }}>WHEN DID YOU DO THIS?</div>
+        <input
+          type="date"
+          value={date}
+          max={new Date().toISOString().slice(0, 10)}
+          onChange={(e) => setDate(e.target.value)}
+          className="fg-mono"
+          style={{ width: "100%", background: C.bgCard, border: `1px solid ${C.line}`, borderRadius: 10, padding: "13px 14px", color: C.textHi, fontSize: 15, marginBottom: 18, colorScheme: "dark" }}
+        />
+
+        <button
+          onClick={() => setPicking(true)}
+          className="fg-display"
+          style={{
+            width: "100%", background: `${C.blue}1A`, border: `1px solid ${C.blue}`, borderRadius: 12,
+            padding: "15px", color: C.accent, fontWeight: 700, fontSize: 16,
+            display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
+          }}
+        >
+          <Plus size={18} /> Add Exercise
+        </button>
+      </div>
+
+      <div style={{ padding: "22px 20px 0" }}>
+        {log.length === 0 ? (
+          <div className="fg-mono" style={{ color: C.textLo, fontSize: 13, textAlign: "center", padding: 30, border: `1px dashed ${C.line}`, borderRadius: 12 }}>
+            Nothing logged yet. Add an exercise and record what you did.
+          </div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {[...log].reverse().map((entry, i) => (
+              <div key={i} style={{ background: C.bgCard, border: `1px solid ${C.line}`, borderRadius: 12, padding: "12px 14px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                <div>
+                  <div className="fg-display" style={{ color: C.textHi, fontSize: 16, fontWeight: 600 }}>{entry.exerciseName}</div>
+                  <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, marginTop: 2 }}>
+                    {entry.reps ? `${entry.reps} reps` : ""}{entry.weight ? ` · ${entry.weight} lbs` : ""}{entry.rpe ? ` · RPE ${entry.rpe}` : ""}
+                  </div>
+                </div>
+                <Check size={16} color="#22C55E" />
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {log.length > 0 && (
+        <div style={{ position: "fixed", bottom: 0, left: 0, right: 0, padding: 16, background: `linear-gradient(0deg, ${C.bg} 60%, transparent)` }}>
+          <button onClick={handleSave} className="fg-display" style={{ width: "100%", background: "#16A34A", border: "none", borderRadius: 14, padding: "16px", color: "white", fontWeight: 700, fontSize: 17 }}>
+            Save This Workout
+          </button>
+        </div>
+      )}
+
+      {picking && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 60, display: "flex", alignItems: "flex-end" }} onClick={() => setPicking(false)}>
+          <div onClick={(e) => e.stopPropagation()} style={{ width: "100%", maxHeight: "70vh", overflowY: "auto", background: C.bgRaised, borderTop: `1px solid ${C.line}`, borderRadius: "20px 20px 0 0", padding: 20 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10, background: C.bgCard, border: `1px solid ${C.line}`, borderRadius: 12, padding: "12px 14px", marginBottom: 14 }}>
+              <Search size={16} color={C.textLo} />
+              <input
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Search exercises"
+                className="fg-mono"
+                style={{ background: "none", border: "none", outline: "none", color: C.textHi, fontSize: 14, width: "100%" }}
+                autoFocus
+              />
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {filtered.map((ex) => (
+                <div
+                  key={ex.id}
+                  onClick={() => { setPicking(false); setQuery(""); setLogging(ex); }}
+                  style={{ background: C.bgCard, border: `1px solid ${C.line}`, borderRadius: 12, padding: "13px 14px", display: "flex", justifyContent: "space-between", alignItems: "center" }}
+                >
+                  <div>
+                    <div className="fg-display" style={{ color: C.textHi, fontSize: 16, fontWeight: 600 }}>{ex.name}</div>
+                    <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, marginTop: 2 }}>{ex.category} · {ex.equipment}</div>
+                  </div>
+                  <Plus size={16} color={C.accent} />
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {logging && (
+        <FreestyleLogEntry
+          exercise={logging}
+          setNumber={log.filter((l) => l.exerciseId === logging.id).length + 1}
+          onClose={() => setLogging(null)}
+          onLog={(entry) => { setLog((l) => [...l, entry]); setLogging(null); }}
+        />
       )}
     </div>
   );
@@ -5185,6 +5483,39 @@ export default function App() {
     }
   };
 
+  const updateSet = async (sessionId, setId, patch) => {
+    setHistory((h) => h.map((s) => (s.id === sessionId ? { ...s, sets: s.sets.map((st) => (st.id === setId ? { ...st, ...patch } : st)) } : s)));
+    try {
+      const token = await getValidToken(authSession, setAuthSession);
+      if (!token) throw new Error("Not signed in");
+      await updateCloudSet(token, setId, patch);
+    } catch (e) {
+      setCloudError("Updated locally, but couldn't sync to the server.");
+    }
+  };
+
+  const deleteSet = async (sessionId, setId) => {
+    setHistory((h) => h.map((s) => (s.id === sessionId ? { ...s, sets: s.sets.filter((st) => st.id !== setId) } : s)));
+    try {
+      const token = await getValidToken(authSession, setAuthSession);
+      if (!token) throw new Error("Not signed in");
+      await deleteCloudSet(token, setId);
+    } catch (e) {
+      setCloudError("Deleted locally, but couldn't sync to the server.");
+    }
+  };
+
+  const deleteSession = async (sessionId) => {
+    setHistory((h) => h.filter((s) => s.id !== sessionId));
+    try {
+      const token = await getValidToken(authSession, setAuthSession);
+      if (!token) throw new Error("Not signed in");
+      await deleteCloudSession(token, sessionId);
+    } catch (e) {
+      setCloudError("Deleted locally, but couldn't sync to the server.");
+    }
+  };
+
   const saveTemplate = async (tpl) => {
     setTemplates((t) => [...t, tpl]); // optimistic
     try {
@@ -5300,7 +5631,16 @@ export default function App() {
       />
     );
   } else if (view === "history") {
-    screen = <HistoryScreen liveHistory={history} onBack={() => setView("home")} />;
+    screen = (
+      <HistoryScreen
+        liveHistory={history}
+        onBack={() => setView("home")}
+        onSaveSession={saveSession}
+        onUpdateSet={updateSet}
+        onDeleteSet={deleteSet}
+        onDeleteSession={deleteSession}
+      />
+    );
   } else if (view === "freestyle") {
     screen = <FreestyleSessionScreen onExit={() => setView("home")} onSaveSession={saveSession} />;
   } else if (view === "active") {
