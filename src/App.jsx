@@ -1225,6 +1225,7 @@ function sessionRecordToDbPayload(record, userId) {
       mode: record.mode,
       duration_sec: record.durationSec,
       started_at: new Date(record.date).toISOString(),
+      overall_rpe: record.overallRpe || null,
     },
     sets: record.sets.map((s) => ({
       exercise_id: s.exerciseId,
@@ -1245,6 +1246,7 @@ function dbSessionToRecord(row) {
     source: row.source,
     mode: row.mode,
     durationSec: row.duration_sec,
+    overallRpe: row.overall_rpe,
     sets: (row.sets || []).map((s) => ({
       id: s.id,
       exerciseId: s.exercise_id,
@@ -2932,18 +2934,6 @@ function ActiveWorkoutScreen({ buildList, burnoutList, config, squadInfo, onExit
     return () => clearInterval(t);
   }, [finished]);
 
-  const handleSaveSession = () => {
-    onSaveSession({
-      id: `s_${Date.now()}`,
-      date: Date.now(),
-      source: "builder",
-      mode: config.mode,
-      durationSec: elapsed,
-      sets: sessionLog,
-    });
-    onExit();
-  };
-
   if (timeline.length === 0) {
     return (
       <div style={{ minHeight: "100vh", background: C.bg, display: "flex", alignItems: "center", justifyContent: "center", padding: 24 }}>
@@ -2965,26 +2955,23 @@ function ActiveWorkoutScreen({ buildList, burnoutList, config, squadInfo, onExit
 
   if (finished) {
     return (
-      <div style={{ minHeight: "100vh", background: C.bg, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24 }}>
-        <FontImport />
-        <div
-          style={{
-            width: 70, height: 70, borderRadius: "50%", background: `${C.blue}22`, border: `1px solid ${C.blue}`,
-            display: "flex", alignItems: "center", justifyContent: "center", marginBottom: 20,
-          }}
-        >
-          <Check size={30} color={C.accent} />
-        </div>
-        <div className="fg-display" style={{ color: C.textHi, fontSize: 30, fontWeight: 700, marginBottom: 6 }}>
-          Session Complete
-        </div>
-        <div className="fg-mono" style={{ color: C.textLo, fontSize: 13, marginBottom: 30 }}>
-          {sessionLog.length} sets logged · {Math.floor(elapsed / 60)} min. Ready to save it to your history?
-        </div>
-        <button onClick={handleSaveSession} className="fg-display" style={{ background: C.blue, border: "none", borderRadius: 12, padding: "15px 34px", color: "white", fontWeight: 700, fontSize: 16 }}>
-          Save Session
-        </button>
-      </div>
+      <ReviewLogScreen
+        sets={sessionLog}
+        durationSec={elapsed}
+        onBack={onExit}
+        onConfirm={({ sets, overallRpe }) => {
+          onSaveSession({
+            id: `s_${Date.now()}`,
+            date: Date.now(),
+            source: "builder",
+            mode: config.mode,
+            durationSec: elapsed,
+            sets,
+            overallRpe,
+          });
+          onExit();
+        }}
+      />
     );
   }
 
@@ -3791,6 +3778,109 @@ function RestLogScreen({ exercises, setNumber, totalSets, squadInfo, onClose, on
 /* ============================================================
    FREESTYLE SESSION — no builder, add & log exercises live
    ============================================================ */
+/* ============================================================
+   REVIEW LOG — shown right after finishing a workout. Lets you
+   adjust any set before it's saved for real, and rate the whole
+   session's effort (separate from each set's own RPE).
+   ============================================================ */
+function ReviewLogScreen({ sets, durationSec, onBack, onConfirm }) {
+  const [editableSets, setEditableSets] = useState(sets);
+  const [overallRpe, setOverallRpe] = useState(null);
+  const [editingIndex, setEditingIndex] = useState(null);
+
+  const grouped = editableSets.reduce((acc, s, i) => {
+    (acc[s.exerciseName] = acc[s.exerciseName] || []).push({ ...s, _index: i });
+    return acc;
+  }, {});
+
+  const updateSet = (index, patch) => setEditableSets((list) => list.map((s, i) => (i === index ? { ...s, ...patch } : s)));
+  const deleteSet = (index) => setEditableSets((list) => list.filter((_, i) => i !== index));
+
+  return (
+    <div style={{ minHeight: "100vh", background: C.bg, paddingBottom: 110 }}>
+      <FontImport />
+      <div style={{ padding: "22px 20px 6px", display: "flex", alignItems: "center", gap: 12 }}>
+        <button onClick={onBack} style={{ background: "none", border: "none" }}>
+          <ArrowLeft size={20} color={C.textLo} />
+        </button>
+        <h1 className="fg-display" style={{ color: C.textHi, fontSize: 24, fontWeight: 700, margin: 0 }}>Review Log</h1>
+      </div>
+
+      <div style={{ padding: "10px 20px 0" }}>
+        <div className="fg-mono" style={{ color: C.textLo, fontSize: 13, marginBottom: 20, lineHeight: 1.5 }}>
+          {Object.keys(grouped).length} exercises · {editableSets.length} sets · {Math.floor(durationSec / 60)} min. Tap any set to adjust it before saving.
+        </div>
+
+        {Object.keys(grouped).length === 0 ? (
+          <div className="fg-mono" style={{ color: C.textLo, fontSize: 13, textAlign: "center", padding: 30, border: `1px dashed ${C.line}`, borderRadius: 12, marginBottom: 20 }}>
+            Nothing was logged this session.
+          </div>
+        ) : (
+          Object.entries(grouped).map(([name, setsForEx]) => (
+            <div key={name} style={{ marginBottom: 18 }}>
+              <div className="fg-display" style={{ color: C.textHi, fontSize: 17, fontWeight: 600, marginBottom: 8 }}>{name}</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                {setsForEx.map((s) => (
+                  <div
+                    key={s._index}
+                    onClick={() => setEditingIndex(s._index)}
+                    className="fg-tap"
+                    style={{ display: "flex", justifyContent: "space-between", alignItems: "center", background: C.bgCard, border: `1px solid ${C.line}`, borderRadius: 10, padding: "11px 13px", cursor: "pointer" }}
+                  >
+                    <span className="fg-mono" style={{ color: C.textLo, fontSize: 12 }}>
+                      Set {s.setNumber || "—"}: {s.reps || "—"} reps{s.weight ? ` · ${s.weight} lbs (${s.weightType || "Other"})` : ""}{s.rpe ? ` · RPE ${s.rpe}` : ""}
+                    </span>
+                    <MoreHorizontal size={14} color={C.textLo} />
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))
+        )}
+
+        <div style={{ background: C.bgCard, border: `1px solid ${C.line}`, borderRadius: 14, padding: 16, marginTop: 8, marginBottom: 24 }}>
+          <div className="fg-mono" style={{ color: C.textLo, fontSize: 12, letterSpacing: "0.08em", marginBottom: 4 }}>OVERALL WORKOUT RPE</div>
+          <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, marginBottom: 12 }}>How did the whole session feel? 1 = easy, 10 = max effort.</div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 8 }}>
+            {Array.from({ length: 10 }).map((_, i) => {
+              const v = i + 1;
+              return (
+                <button
+                  key={v}
+                  onClick={() => setOverallRpe(v)}
+                  className="fg-mono"
+                  style={{ padding: "14px 0", borderRadius: 10, border: `1px solid ${overallRpe === v ? C.blue : C.line}`, background: overallRpe === v ? `${C.blue}33` : "transparent", color: overallRpe === v ? C.accent : C.textLo, fontSize: 15, fontWeight: 600 }}
+                >
+                  {v}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+
+      <div style={{ position: "fixed", bottom: 0, left: 0, right: 0, padding: 16, background: `linear-gradient(0deg, ${C.bg} 60%, transparent)` }}>
+        <button
+          onClick={() => onConfirm({ sets: editableSets, overallRpe })}
+          className="fg-display"
+          style={{ width: "100%", background: "#16A34A", border: "none", borderRadius: 14, padding: "16px", color: "white", fontWeight: 700, fontSize: 17 }}
+        >
+          Save Session
+        </button>
+      </div>
+
+      {editingIndex !== null && (
+        <SetEditSheet
+          set={editableSets[editingIndex]}
+          onClose={() => setEditingIndex(null)}
+          onSave={(patch) => { updateSet(editingIndex, patch); setEditingIndex(null); }}
+          onDelete={() => { deleteSet(editingIndex); setEditingIndex(null); }}
+        />
+      )}
+    </div>
+  );
+}
+
 function FreestyleSessionScreen({ onExit, onSaveSession }) {
   const [elapsed, setElapsed] = useState(0);
   const [log, setLog] = useState([]);
@@ -3810,34 +3900,25 @@ function FreestyleSessionScreen({ onExit, onSaveSession }) {
 
   const filtered = EXERCISES.filter((ex) => ex.name.toLowerCase().includes(query.toLowerCase()));
 
-  const handleSaveSession = () => {
-    onSaveSession({
-      id: `s_${Date.now()}`,
-      date: Date.now(),
-      source: "freestyle",
-      mode: "Freestyle",
-      durationSec: elapsed,
-      sets: log,
-    });
-    onExit();
-  };
-
   if (finished) {
-    const exerciseCount = new Set(log.map((l) => l.exerciseId)).size;
     return (
-      <div style={{ minHeight: "100vh", background: C.bg, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24 }}>
-        <FontImport />
-        <div style={{ width: 70, height: 70, borderRadius: "50%", background: `${C.blue}22`, border: `1px solid ${C.blue}`, display: "flex", alignItems: "center", justifyContent: "center", marginBottom: 20 }}>
-          <Check size={30} color={C.accent} />
-        </div>
-        <div className="fg-display" style={{ color: C.textHi, fontSize: 30, fontWeight: 700, marginBottom: 6 }}>Session Complete</div>
-        <div className="fg-mono" style={{ color: C.textLo, fontSize: 13, marginBottom: 30, textAlign: "center" }}>
-          {exerciseCount} exercises · {log.length} sets logged · {mm}:{ss}
-        </div>
-        <button onClick={handleSaveSession} className="fg-display" style={{ background: C.blue, border: "none", borderRadius: 12, padding: "15px 34px", color: "white", fontWeight: 700, fontSize: 16 }}>
-          Save Session
-        </button>
-      </div>
+      <ReviewLogScreen
+        sets={log}
+        durationSec={elapsed}
+        onBack={onExit}
+        onConfirm={({ sets, overallRpe }) => {
+          onSaveSession({
+            id: `s_${Date.now()}`,
+            date: Date.now(),
+            source: "freestyle",
+            mode: "Freestyle",
+            durationSec: elapsed,
+            sets,
+            overallRpe,
+          });
+          onExit();
+        }}
+      />
     );
   }
 
@@ -4383,7 +4464,7 @@ function HistoryScreen({ liveHistory, onBack, onSaveSession, onUpdateSet, onDele
                           <span className="fg-mono" style={{ color: C.textLo, fontSize: 11, marginLeft: 8 }}>{s.mode}</span>
                         </div>
                         <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, marginTop: 2 }}>
-                          {exCount} exercises · {s.sets.length} sets · {s.durationSec ? `${Math.round(s.durationSec / 60)} min` : "duration unknown"}
+                          {exCount} exercises · {s.sets.length} sets · {s.durationSec ? `${Math.round(s.durationSec / 60)} min` : "duration unknown"}{s.overallRpe ? ` · Overall RPE ${s.overallRpe}` : ""}
                         </div>
                       </div>
                       <button onClick={() => setConfirmingDeleteId(s.id)} style={{ background: "none", border: "none", padding: 6 }}>
