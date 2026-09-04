@@ -166,16 +166,27 @@ const FontImport = () => (
   <style>{`
     @import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;500;600;700;800&family=DM+Mono:wght@400;500&display=swap');
     * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
     .fg-display { font-family: 'Barlow Condensed', sans-serif; letter-spacing: 0.01em; }
     .fg-mono { font-family: 'DM Mono', monospace; }
     ::selection { background: ${C.blue}; color: white; }
     input::placeholder { color: ${C.textLo}; }
-    button { font-family: inherit; cursor: pointer; }
+    button { font-family: inherit; cursor: pointer; transition: transform 0.12s ease, opacity 0.12s ease, background 0.15s ease, border-color 0.15s ease; }
+    button:active { transform: scale(0.97); opacity: 0.9; }
+    .fg-tap { transition: transform 0.12s ease, opacity 0.12s ease, border-color 0.15s ease, background 0.15s ease; }
+    .fg-tap:active { transform: scale(0.98); opacity: 0.85; }
     @media (prefers-reduced-motion: reduce) {
       * { animation-duration: 0.001ms !important; transition-duration: 0.001ms !important; }
+      html { scroll-behavior: auto; }
     }
     @keyframes fgPulse { 0% { opacity: 0.55; } 50% { opacity: 1; } 100% { opacity: 0.55; } }
     .fg-pulse { animation: fgPulse 1.6s ease-in-out infinite; }
+    @keyframes fgScreenIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+    .fg-screen-in { animation: fgScreenIn 0.32s cubic-bezier(0.16, 1, 0.3, 1); }
+    @keyframes fgSheetUp { from { transform: translateY(100%); } to { transform: translateY(0); } }
+    .fg-sheet-in { animation: fgSheetUp 0.28s cubic-bezier(0.16, 1, 0.3, 1); }
+    @keyframes fgFadeIn { from { opacity: 0; } to { opacity: 1; } }
+    .fg-fade-in { animation: fgFadeIn 0.2s ease-out; }
   `}</style>
 );
 
@@ -541,6 +552,7 @@ function HomeScreen({ user, history, templates, squadMembers, activeProgramRow, 
         <div style={{ padding: "18px 20px 6px" }}>
           <div
             onClick={onOpenPrograms}
+            className="fg-tap"
             style={{
               background: `${activeProgram.color}14`, border: `1px solid ${activeProgram.color}`, borderRadius: 14,
               padding: 16, cursor: "pointer",
@@ -569,6 +581,7 @@ function HomeScreen({ user, history, templates, squadMembers, activeProgramRow, 
       <div style={{ padding: "22px 20px 6px" }}>
         <div
           onClick={onOpenSocial}
+          className="fg-tap"
           style={{
             background: C.bgCard,
             border: `1px solid ${C.line}`,
@@ -687,6 +700,7 @@ function HomeScreen({ user, history, templates, squadMembers, activeProgramRow, 
             <div
               key={t.id}
               onClick={() => onLoadTemplate(t)}
+              className="fg-tap"
               style={{
                 minWidth: 150,
                 background: C.bgCard,
@@ -1418,7 +1432,7 @@ function ExerciseDetailSheet({ exercise, onClose, onAddToBuild, onAddToBurnout, 
       onClick={onClose}
     >
       <div
-        onClick={(e) => e.stopPropagation()}
+        onClick={(e) => e.stopPropagation()} className="fg-sheet-in"
         style={{
           width: "100%",
           background: C.bgRaised,
@@ -1653,6 +1667,7 @@ function LibraryTab({ onAddToBuild, onAddToBurnout, addedIds, burnoutIds }) {
             <div
               key={ex.id}
               onClick={() => setDetail(ex)}
+              className="fg-tap"
               style={{
                 background: C.bgCard,
                 border: `1px solid ${C.line}`,
@@ -1755,7 +1770,7 @@ function FilterSheet({
   return (
     <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 55, display: "flex", alignItems: "flex-end" }} onClick={onClose}>
       <div
-        onClick={(e) => e.stopPropagation()}
+        onClick={(e) => e.stopPropagation()} className="fg-sheet-in"
         style={{ width: "100%", maxHeight: "85vh", overflowY: "auto", background: C.bgRaised, borderTop: `1px solid ${C.line}`, borderRadius: "20px 20px 0 0", padding: 22 }}
       >
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
@@ -1840,7 +1855,7 @@ function OverrideMenu({ item, config, onChange, onClose, onUnlinkSuperset, onCha
       onClick={onClose}
     >
       <div
-        onClick={(e) => e.stopPropagation()}
+        onClick={(e) => e.stopPropagation()} className="fg-sheet-in"
         style={{
           width: "100%",
           background: C.bgRaised,
@@ -2522,7 +2537,7 @@ function LibraryBuilderScreen({ onBack, onStartWorkout, initialSession, onSaveTe
           style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 75, display: "flex", alignItems: "flex-end" }}
           onClick={() => setNamingTemplate(false)}
         >
-          <div onClick={(e) => e.stopPropagation()} style={{ width: "100%", background: C.bgRaised, borderTop: `1px solid ${C.line}`, borderRadius: "20px 20px 0 0", padding: 22 }}>
+          <div onClick={(e) => e.stopPropagation()} className="fg-sheet-in" style={{ width: "100%", background: C.bgRaised, borderTop: `1px solid ${C.line}`, borderRadius: "20px 20px 0 0", padding: 22 }}>
             <div className="fg-display" style={{ color: C.textHi, fontSize: 20, fontWeight: 700, marginBottom: 14 }}>
               Name this template
             </div>
@@ -3289,7 +3304,7 @@ function ActiveWorkoutScreen({ buildList, burnoutList, config, squadInfo, onExit
 
       {showSquadExpand && squadInfo && (
         <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.75)", zIndex: 90, display: "flex", flexDirection: "column" }} onClick={() => setShowSquadExpand(false)}>
-          <div onClick={(e) => e.stopPropagation()} style={{ marginTop: "auto", background: C.bgRaised, borderTop: `1px solid ${C.line}`, borderRadius: "20px 20px 0 0", padding: 22, maxHeight: "85vh", overflowY: "auto" }}>
+          <div onClick={(e) => e.stopPropagation()} className="fg-sheet-in" style={{ marginTop: "auto", background: C.bgRaised, borderTop: `1px solid ${C.line}`, borderRadius: "20px 20px 0 0", padding: 22, maxHeight: "85vh", overflowY: "auto" }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
               <div className="fg-display" style={{ color: C.textHi, fontSize: 20, fontWeight: 700 }}>Squad</div>
               <button onClick={() => setShowSquadExpand(false)} style={{ background: "none", border: "none" }}>
@@ -3896,7 +3911,7 @@ function FreestyleSessionScreen({ onExit, onSaveSession }) {
       {/* exercise picker */}
       {picking && (
         <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 60, display: "flex", alignItems: "flex-end" }} onClick={() => setPicking(false)}>
-          <div onClick={(e) => e.stopPropagation()} style={{ width: "100%", maxHeight: "75vh", overflowY: "auto", background: C.bgRaised, borderTop: `1px solid ${C.line}`, borderRadius: "20px 20px 0 0", padding: 20 }}>
+          <div onClick={(e) => e.stopPropagation()} className="fg-sheet-in" style={{ width: "100%", maxHeight: "75vh", overflowY: "auto", background: C.bgRaised, borderTop: `1px solid ${C.line}`, borderRadius: "20px 20px 0 0", padding: 20 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 10, background: C.bgCard, border: `1px solid ${C.line}`, borderRadius: 12, padding: "12px 14px", marginBottom: 14 }}>
               <Search size={16} color={C.textLo} />
               <input
@@ -3952,7 +3967,7 @@ function FreestyleLogEntry({ exercise, setNumber, onClose, onLog }) {
 
   return (
     <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 65, display: "flex", alignItems: "flex-end" }} onClick={onClose}>
-      <div onClick={(e) => e.stopPropagation()} style={{ width: "100%", background: C.bgRaised, borderTop: `1px solid ${C.line}`, borderRadius: "20px 20px 0 0", padding: 22, maxHeight: "85vh", overflowY: "auto" }}>
+      <div onClick={(e) => e.stopPropagation()} className="fg-sheet-in" style={{ width: "100%", background: C.bgRaised, borderTop: `1px solid ${C.line}`, borderRadius: "20px 20px 0 0", padding: 22, maxHeight: "85vh", overflowY: "auto" }}>
         <div className="fg-display" style={{ color: C.textHi, fontSize: 22, fontWeight: 700, marginBottom: 4 }}>{exercise.name}</div>
         <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, letterSpacing: "0.08em", marginBottom: 16 }}>SET {setNumber}</div>
 
@@ -4352,7 +4367,7 @@ function HistoryScreen({ liveHistory, onBack, onSaveSession, onUpdateSet, onDele
                     </div>
                   ) : (
                     <div style={{ padding: "13px 14px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                      <div onClick={() => setExpandedSession(expanded ? null : s.id)} style={{ cursor: "pointer", flex: 1 }}>
+                      <div onClick={() => setExpandedSession(expanded ? null : s.id)} className="fg-tap" style={{ cursor: "pointer", flex: 1 }}>
                         <div className="fg-display" style={{ color: C.textHi, fontSize: 16, fontWeight: 600 }}>
                           {new Date(s.date).toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" })}
                           <span className="fg-mono" style={{ color: C.textLo, fontSize: 11, marginLeft: 8 }}>{s.mode}</span>
@@ -4364,7 +4379,7 @@ function HistoryScreen({ liveHistory, onBack, onSaveSession, onUpdateSet, onDele
                       <button onClick={() => setConfirmingDeleteId(s.id)} style={{ background: "none", border: "none", padding: 6 }}>
                         <X size={15} color={C.textLo} />
                       </button>
-                      <div onClick={() => setExpandedSession(expanded ? null : s.id)} style={{ cursor: "pointer", padding: 4 }}>
+                      <div onClick={() => setExpandedSession(expanded ? null : s.id)} className="fg-tap" style={{ cursor: "pointer", padding: 4 }}>
                         <ChevronRight size={16} color={C.textLo} style={{ transform: expanded ? "rotate(90deg)" : "none", transition: "transform 0.2s" }} />
                       </div>
                     </div>
@@ -4593,7 +4608,7 @@ function SetEditSheet({ set, onClose, onSave, onDelete }) {
 
   return (
     <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 80, display: "flex", alignItems: "flex-end" }} onClick={onClose}>
-      <div onClick={(e) => e.stopPropagation()} style={{ width: "100%", background: C.bgRaised, borderTop: `1px solid ${C.line}`, borderRadius: "20px 20px 0 0", padding: 22, maxHeight: "85vh", overflowY: "auto" }}>
+      <div onClick={(e) => e.stopPropagation()} className="fg-sheet-in" style={{ width: "100%", background: C.bgRaised, borderTop: `1px solid ${C.line}`, borderRadius: "20px 20px 0 0", padding: 22, maxHeight: "85vh", overflowY: "auto" }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
           <div className="fg-display" style={{ color: C.textHi, fontSize: 20, fontWeight: 700 }}>Edit Set</div>
           <button onClick={onClose} style={{ background: "none", border: "none" }}>
@@ -4757,7 +4772,7 @@ function BackfillWorkoutScreen({ onCancel, onSave }) {
 
       {picking && (
         <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 60, display: "flex", alignItems: "flex-end" }} onClick={() => setPicking(false)}>
-          <div onClick={(e) => e.stopPropagation()} style={{ width: "100%", maxHeight: "70vh", overflowY: "auto", background: C.bgRaised, borderTop: `1px solid ${C.line}`, borderRadius: "20px 20px 0 0", padding: 20 }}>
+          <div onClick={(e) => e.stopPropagation()} className="fg-sheet-in" style={{ width: "100%", maxHeight: "70vh", overflowY: "auto", background: C.bgRaised, borderTop: `1px solid ${C.line}`, borderRadius: "20px 20px 0 0", padding: 20 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 10, background: C.bgCard, border: `1px solid ${C.line}`, borderRadius: 12, padding: "12px 14px", marginBottom: 14 }}>
               <Search size={16} color={C.textLo} />
               <input
@@ -5087,7 +5102,7 @@ function SocialScreen({ user, history, onBack, onSignOut, onStartSquad, onChange
 
       {showProfile && (
         <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 60, display: "flex", alignItems: "flex-end" }} onClick={() => setShowProfile(false)}>
-          <div onClick={(e) => e.stopPropagation()} style={{ width: "100%", background: C.bgRaised, borderTop: `1px solid ${C.line}`, borderRadius: "20px 20px 0 0", padding: 22, maxHeight: "80vh", overflowY: "auto" }}>
+          <div onClick={(e) => e.stopPropagation()} className="fg-sheet-in" style={{ width: "100%", background: C.bgRaised, borderTop: `1px solid ${C.line}`, borderRadius: "20px 20px 0 0", padding: 22, maxHeight: "80vh", overflowY: "auto" }}>
             <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 4 }}>
               <button onClick={() => setShowProfile(false)} style={{ background: "none", border: "none" }}>
                 <X size={20} color={C.textLo} />
@@ -5288,7 +5303,7 @@ function SquadSessionScreen({
   const [lastSeenChatCount, setLastSeenChatCount] = useState(SQUAD_CHAT_SEED.length);
 
   useEffect(() => {
-    if (chatScrollRef.current) chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight;
+    if (chatScrollRef.current) chatScrollRef.current.scrollTo({ top: chatScrollRef.current.scrollHeight, behavior: "smooth" });
   }, [chat, showChat]);
   const [bpm, setBpm] = useState(128);
   const [playing, setPlaying] = useState(false);
@@ -6279,7 +6294,9 @@ export default function App() {
 
   return (
     <>
-      {screen}
+      <div key={view} className="fg-screen-in">
+        {screen}
+      </div>
       {cloudError && (
         <div
           style={{
