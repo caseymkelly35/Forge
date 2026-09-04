@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useLayoutEffect, useMemo, useRef } from "react";
-import { Dumbbell, Flame, Users, ChevronRight, Play, Pause, Plus, Apple, Chrome, Search, MoreHorizontal, GripVertical, Link2, X, Home as HomeIcon, LayoutList, Save, ArrowLeft, Check, SkipForward, ArrowRight, SplitSquareHorizontal, Trophy, TrendingUp, Activity, Calendar, Copy, UserPlus, LogOut, Mail, MessageCircle, Send, Music, Crown, Zap } from "lucide-react";
+import { Dumbbell, Flame, Users, ChevronRight, Play, Pause, Plus, Apple, Chrome, Search, MoreHorizontal, GripVertical, Link2, X, Home as HomeIcon, LayoutList, Save, ArrowLeft, Check, SkipForward, ArrowRight, SplitSquareHorizontal, Trophy, TrendingUp, Activity, Calendar, Copy, UserPlus, LogOut, Mail, MessageCircle, Send, Music, Crown, Zap, Camera } from "lucide-react";
 import { LineChart, Line, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
 
 /* ============================================================
@@ -118,6 +118,36 @@ async function fetchHasOnboarded(token, userId) {
 
 async function markOnboarded(token, userId) {
   await supabaseRest(`profiles?id=eq.${userId}`, { method: "PATCH", token, body: { has_onboarded: true } });
+}
+
+async function fetchProfileExtras(token, userId) {
+  const rows = await supabaseRest(`profiles?id=eq.${userId}&select=has_onboarded,avatar_url`, { token });
+  return rows?.[0] || { has_onboarded: false, avatar_url: null };
+}
+
+async function uploadAvatar(token, userId, file) {
+  const ext = (file.name.split(".").pop() || "jpg").toLowerCase();
+  const path = `${userId}/avatar.${ext}`;
+  const res = await fetch(`${SUPABASE_URL}/storage/v1/object/avatars/${path}`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      apikey: SUPABASE_ANON_KEY,
+      "Content-Type": file.type || "image/jpeg",
+      "x-upsert": "true",
+    },
+    body: file,
+  });
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    throw new Error(errText || `Upload failed (${res.status})`);
+  }
+  // cache-bust so a re-uploaded photo at the same path shows immediately
+  return `${SUPABASE_URL}/storage/v1/object/public/avatars/${path}?t=${Date.now()}`;
+}
+
+async function updateProfileAvatar(token, userId, avatarUrl) {
+  await supabaseRest(`profiles?id=eq.${userId}`, { method: "PATCH", token, body: { avatar_url: avatarUrl } });
 }
 
 const C = {
@@ -3121,9 +3151,7 @@ function ActiveWorkoutScreen({ buildList, burnoutList, config, squadInfo, onExit
                 }}
               >
                 <div style={{ position: "relative", flexShrink: 0 }}>
-                  <div style={{ width: 36, height: 36, borderRadius: "50%", background: `linear-gradient(135deg, ${m.color[0]}, ${m.color[1]})`, display: "flex", alignItems: "center", justifyContent: "center" }}>
-                    <span className="fg-display" style={{ color: C.bg, fontWeight: 700, fontSize: 14 }}>{m.name[0]}</span>
-                  </div>
+                  <MemberAvatar member={m} size={36} />
                   <div style={{ position: "absolute", bottom: -1, right: -1, width: 9, height: 9, borderRadius: "50%", background: m.online ? "#22C55E" : C.textLo, border: `2px solid ${C.bgCard}` }} />
                 </div>
                 <div style={{ minWidth: 0 }}>
@@ -3249,13 +3277,9 @@ function ActiveWorkoutScreen({ buildList, burnoutList, config, squadInfo, onExit
             {squadInfo.members.slice(0, 3).map((m, i) => (
               <div
                 key={m.id}
-                style={{
-                  width: 20, height: 20, borderRadius: "50%", background: `linear-gradient(135deg, ${m.color[0]}, ${m.color[1]})`,
-                  display: "flex", alignItems: "center", justifyContent: "center",
-                  marginLeft: i === 0 ? 0 : -8, border: `1.5px solid ${C.bgRaised}`,
-                }}
+                style={{ marginLeft: i === 0 ? 0 : -8, border: `1.5px solid ${C.bgRaised}`, borderRadius: "50%" }}
               >
-                <span className="fg-display" style={{ color: C.bg, fontWeight: 700, fontSize: 9 }}>{m.name[0]}</span>
+                <MemberAvatar member={m} size={20} />
               </div>
             ))}
           </div>
@@ -3302,8 +3326,8 @@ function ActiveWorkoutScreen({ buildList, burnoutList, config, squadInfo, onExit
                     <span className="fg-display" style={{ color: C.textHi, fontSize: 15, fontWeight: 600, flex: 1 }}>{st.name}</span>
                     <div style={{ display: "flex", gap: 3 }}>
                       {here.map((m) => (
-                        <div key={m.id} title={m.name} style={{ width: 22, height: 22, borderRadius: "50%", background: `linear-gradient(135deg, ${m.color[0]}, ${m.color[1]})`, display: "flex", alignItems: "center", justifyContent: "center" }}>
-                          <span className="fg-display" style={{ color: C.bg, fontWeight: 700, fontSize: 10 }}>{m.name[0]}</span>
+                        <div key={m.id} title={m.name}>
+                          <MemberAvatar member={m} size={22} />
                         </div>
                       ))}
                     </div>
@@ -4787,8 +4811,17 @@ function avatarColorFor(name) {
   return colors[idx];
 }
 
-function Avatar({ name, size = 44 }) {
+function Avatar({ name, size = 44, url }) {
   const [c1, c2] = avatarColorFor(name);
+  if (url) {
+    return (
+      <img
+        src={url}
+        alt={name}
+        style={{ width: size, height: size, borderRadius: "50%", objectFit: "cover", flexShrink: 0 }}
+      />
+    );
+  }
   return (
     <div
       style={{
@@ -4804,16 +4837,65 @@ function Avatar({ name, size = 44 }) {
   );
 }
 
-function SocialScreen({ user, history, onBack, onSignOut, onStartSquad }) {
+// For squad-member objects, which carry their own [c1, c2] gradient pair
+// instead of deriving it from the name — same idea, real photo if present
+// (only ever true for "you"; mock squad members don't have real photos).
+function MemberAvatar({ member, size = 40 }) {
+  if (member.avatarUrl) {
+    return (
+      <img
+        src={member.avatarUrl}
+        alt={member.name}
+        style={{ width: size, height: size, borderRadius: "50%", objectFit: "cover", flexShrink: 0 }}
+      />
+    );
+  }
+  return (
+    <div
+      style={{
+        width: size, height: size, borderRadius: "50%",
+        background: `linear-gradient(135deg, ${member.color[0]}, ${member.color[1]})`,
+        display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0,
+      }}
+    >
+      <span className="fg-display" style={{ color: C.bg, fontWeight: 700, fontSize: size * 0.4 }}>
+        {member.name[0]?.toUpperCase()}
+      </span>
+    </div>
+  );
+}
+
+function SocialScreen({ user, history, onBack, onSignOut, onStartSquad, onChangeAvatar }) {
   const [friends, setFriends] = useState([]);
   const [requests, setRequests] = useState([]);
   const [copied, setCopied] = useState(false);
   const [invitedToast, setInvitedToast] = useState(null);
   const [socialHydrated, setSocialHydrated] = useState(false);
   const [showProfile, setShowProfile] = useState(false);
+  const [uploadingAvatar, setUploadingAvatar] = useState(false);
+  const [avatarError, setAvatarError] = useState("");
+  const fileInputRef = useRef(null);
   const inviteCode = useMemo(() => `FORGE-${(user?.name || "YOU").slice(0, 3).toUpperCase()}${Math.floor(1000 + Math.random() * 9000)}`, [user]);
   const friendsKey = `social-friends:${user?.id || "anon"}`;
   const requestsKey = `social-requests:${user?.id || "anon"}`;
+
+  const handleAvatarFileChange = async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = ""; // allow re-selecting the same file later
+    if (!file) return;
+    setAvatarError("");
+    if (!file.type.startsWith("image/")) {
+      setAvatarError("Please choose an image file.");
+      return;
+    }
+    if (file.size > 5 * 1024 * 1024) {
+      setAvatarError("That photo is a bit large — please choose one under 5MB.");
+      return;
+    }
+    setUploadingAvatar(true);
+    await onChangeAvatar(file);
+    setUploadingAvatar(false);
+  };
 
   useEffect(() => {
     (async () => {
@@ -4874,7 +4956,7 @@ function SocialScreen({ user, history, onBack, onSignOut, onStartSquad }) {
           </h1>
         </div>
         <button onClick={() => setShowProfile(true)} style={{ background: "none", border: "none", padding: 0 }}>
-          <Avatar name={user?.name || "You"} size={38} />
+          <Avatar name={user?.name || "You"} size={38} url={user?.avatarUrl} />
         </button>
       </div>
 
@@ -5012,7 +5094,32 @@ function SocialScreen({ user, history, onBack, onSignOut, onStartSquad }) {
               </button>
             </div>
             <div style={{ display: "flex", flexDirection: "column", alignItems: "center", marginBottom: 26 }}>
-              <Avatar name={user?.name || "Casey"} size={72} />
+              <div
+                onClick={() => fileInputRef.current?.click()}
+                style={{ position: "relative", cursor: "pointer" }}
+                title="Tap to change your photo"
+              >
+                <Avatar name={user?.name || "Casey"} size={72} url={user?.avatarUrl} />
+                <div
+                  style={{
+                    position: "absolute", bottom: -2, right: -2, width: 26, height: 26, borderRadius: "50%",
+                    background: C.blue, border: `2px solid ${C.bgRaised}`, display: "flex", alignItems: "center", justifyContent: "center",
+                  }}
+                >
+                  {uploadingAvatar ? (
+                    <div className="fg-mono" style={{ color: "white", fontSize: 8 }}>···</div>
+                  ) : (
+                    <Camera size={12} color="white" />
+                  )}
+                </div>
+              </div>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="image/*"
+                style={{ display: "none" }}
+                onChange={handleAvatarFileChange}
+              />
               <div className="fg-display" style={{ color: C.textHi, fontSize: 24, fontWeight: 700, marginTop: 12 }}>
                 {user?.name || "Casey"}
               </div>
@@ -5020,6 +5127,9 @@ function SocialScreen({ user, history, onBack, onSignOut, onStartSquad }) {
                 <Mail size={12} color={C.textLo} />
                 <span className="fg-mono" style={{ color: C.textLo, fontSize: 12 }}>{user?.email || "you@forge.app"}</span>
               </div>
+              {avatarError && (
+                <div className="fg-mono" style={{ color: "#F87171", fontSize: 11, marginTop: 8, textAlign: "center" }}>{avatarError}</div>
+              )}
             </div>
 
             <div style={{ display: "flex", gap: 10, marginBottom: 24 }}>
@@ -5334,8 +5444,8 @@ function SquadSessionScreen({
                       <span className="fg-display" style={{ color: C.textHi, fontSize: 14, fontWeight: 600, flex: 1 }}>{st.name}</span>
                       <div style={{ display: "flex", gap: 3 }}>
                         {here.map((m) => (
-                          <div key={m.id} title={m.name} style={{ width: 18, height: 18, borderRadius: "50%", background: `linear-gradient(135deg, ${m.color[0]}, ${m.color[1]})`, display: "flex", alignItems: "center", justifyContent: "center" }}>
-                            <span className="fg-display" style={{ color: C.bg, fontWeight: 700, fontSize: 9 }}>{m.name[0]}</span>
+                          <div key={m.id} title={m.name}>
+                            <MemberAvatar member={m} size={18} />
                           </div>
                         ))}
                       </div>
@@ -5384,12 +5494,11 @@ function SquadSessionScreen({
               >
                 <div
                   style={{
-                    width: 42, height: 42, borderRadius: "50%", background: `linear-gradient(135deg, ${m.color[0]}, ${m.color[1]})`,
-                    display: "flex", alignItems: "center", justifyContent: "center",
+                    borderRadius: "50%",
                     boxShadow: assigningMember === m.id ? `0 0 0 3px ${C.blue}` : "none",
                   }}
                 >
-                  <span className="fg-display" style={{ color: C.bg, fontWeight: 700, fontSize: 16 }}>{m.name[0]}</span>
+                  <MemberAvatar member={m} size={42} />
                 </div>
                 <div style={{ position: "absolute", bottom: -1, right: -1, width: 11, height: 11, borderRadius: "50%", background: m.online ? "#22C55E" : C.textLo, border: `2px solid ${C.bgCard}` }} />
               </div>
@@ -5796,8 +5905,9 @@ export default function App() {
   const [cloudError, setCloudError] = useState("");
   const [needsOnboarding, setNeedsOnboarding] = useState(false);
   const [activeProgramRow, setActiveProgramRow] = useState(null);
+  const [avatarUrl, setAvatarUrl] = useState(null);
 
-  const user = authSession ? { id: authSession.user.id, name: authSession.user.name || authSession.user.email.split("@")[0], email: authSession.user.email } : null;
+  const user = authSession ? { id: authSession.user.id, name: authSession.user.name || authSession.user.email.split("@")[0], email: authSession.user.email, avatarUrl } : null;
 
   // squad rotation state — lifted to App so it keeps ticking even while
   // you're inside your own Active Workout screen (see squadInfo below).
@@ -5827,6 +5937,11 @@ export default function App() {
     return () => clearInterval(t);
   }, [squadSequence.length]);
 
+  // keep the squad roster's "you" entry showing your real photo, once it loads
+  useEffect(() => {
+    setSquadMembers((ms) => ms.map((m) => (m.isMe ? { ...m, avatarUrl } : m)));
+  }, [avatarUrl]);
+
   // On mount: try to restore a real Supabase session (refreshing the token if
   // it's stale). If that succeeds, pull real History + Templates from the cloud.
   useEffect(() => {
@@ -5837,15 +5952,16 @@ export default function App() {
         if (token) {
           setAuthSession((s) => s || stored);
           try {
-            const [cloudHistory, cloudTemplates, onboarded, program] = await Promise.all([
+            const [cloudHistory, cloudTemplates, profileExtras, program] = await Promise.all([
               fetchCloudHistory(token),
               fetchCloudTemplates(token),
-              fetchHasOnboarded(token, stored.user.id),
+              fetchProfileExtras(token, stored.user.id),
               fetchActiveProgram(token),
             ]);
             setHistory(cloudHistory);
             setTemplates([...PRESET_TEMPLATES, ...cloudTemplates]);
-            setNeedsOnboarding(!onboarded);
+            setNeedsOnboarding(!profileExtras.has_onboarded);
+            setAvatarUrl(profileExtras.avatar_url || null);
             setActiveProgramRow(program);
           } catch (e) {
             setCloudError("Couldn't reach the server — showing what's cached locally.");
@@ -5864,15 +5980,16 @@ export default function App() {
   const handleAuthed = async (newSession) => {
     setAuthSession(newSession);
     try {
-      const [cloudHistory, cloudTemplates, onboarded, program] = await Promise.all([
+      const [cloudHistory, cloudTemplates, profileExtras, program] = await Promise.all([
         fetchCloudHistory(newSession.access_token),
         fetchCloudTemplates(newSession.access_token),
-        fetchHasOnboarded(newSession.access_token, newSession.user.id),
+        fetchProfileExtras(newSession.access_token, newSession.user.id),
         fetchActiveProgram(newSession.access_token),
       ]);
       setHistory(cloudHistory);
       setTemplates([...PRESET_TEMPLATES, ...cloudTemplates]);
-      setNeedsOnboarding(!onboarded);
+      setNeedsOnboarding(!profileExtras.has_onboarded);
+      setAvatarUrl(profileExtras.avatar_url || null);
       setActiveProgramRow(program);
     } catch (e) {
       setCloudError("Signed in, but couldn't load your data from the server yet.");
@@ -5885,7 +6002,20 @@ export default function App() {
     setTemplates(PRESET_TEMPLATES);
     setNeedsOnboarding(false);
     setActiveProgramRow(null);
+    setAvatarUrl(null);
     setView("home");
+  };
+
+  const changeAvatar = async (file) => {
+    try {
+      const token = await getValidToken(authSession, setAuthSession);
+      if (!token) throw new Error("Not signed in");
+      const url = await uploadAvatar(token, authSession.user.id, file);
+      await updateProfileAvatar(token, authSession.user.id, url);
+      setAvatarUrl(url);
+    } catch (e) {
+      setCloudError("Couldn't upload that photo — try a smaller image or check your connection.");
+    }
   };
 
   const finishOnboarding = () => {
@@ -6089,6 +6219,7 @@ export default function App() {
         onBack={() => setView("home")}
         onSignOut={signOut}
         onStartSquad={() => setView("squad")}
+        onChangeAvatar={changeAvatar}
       />
     );
   } else if (view === "history") {
