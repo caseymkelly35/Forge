@@ -425,15 +425,24 @@ function AuthScreen({ onAuthed }) {
 /* ============================================================
    HOME SCREEN
    ============================================================ */
-const WEEK = [
-  { d: "M", done: true },
-  { d: "T", done: true },
-  { d: "W", done: false },
-  { d: "T", done: true },
-  { d: "F", done: false },
-  { d: "S", done: false },
-  { d: "S", done: false },
-];
+function getWeekStripData(history) {
+  const dayKeys = new Set((history || []).map((s) => new Date(s.date).toDateString()));
+  const today = new Date();
+  const dow = today.getDay(); // 0=Sun..6=Sat
+  const mondayOffset = dow === 0 ? 6 : dow - 1;
+  const monday = new Date(today);
+  monday.setDate(today.getDate() - mondayOffset);
+  const labels = ["M", "T", "W", "T", "F", "S", "S"];
+  return Array.from({ length: 7 }).map((_, i) => {
+    const d = new Date(monday);
+    d.setDate(monday.getDate() + i);
+    return {
+      d: labels[i],
+      done: dayKeys.has(d.toDateString()),
+      isToday: d.toDateString() === today.toDateString(),
+    };
+  });
+}
 
 const relativeDay = (ts) => {
   const diffDays = Math.floor((Date.now() - ts) / 86400000);
@@ -453,6 +462,7 @@ function HomeScreen({ user, history, templates, squadMembers, activeProgramRow, 
   }));
   const activeProgram = activeProgramRow ? PROGRAMS.find((p) => p.id === activeProgramRow.program_id) : null;
   const todayInfo = activeProgramRow ? getTodayProgramDay(activeProgramRow) : null;
+  const weekStrip = getWeekStripData(history);
 
   const sectionLabel = (text) => (
     <div
@@ -519,7 +529,7 @@ function HomeScreen({ user, history, templates, squadMembers, activeProgramRow, 
 
       {/* week strip */}
       <div style={{ padding: "18px 20px 6px", display: "flex", gap: 8 }}>
-        {WEEK.map((day, i) => (
+        {weekStrip.map((day, i) => (
           <div
             key={i}
             style={{
@@ -528,10 +538,10 @@ function HomeScreen({ user, history, templates, squadMembers, activeProgramRow, 
               padding: "10px 0",
               borderRadius: 10,
               background: day.done ? `${C.blue}22` : C.bgCard,
-              border: `1px solid ${day.done ? C.blue + "55" : C.line}`,
+              border: `1px solid ${day.isToday ? C.accent : day.done ? C.blue + "55" : C.line}`,
             }}
           >
-            <div className="fg-mono" style={{ fontSize: 11, color: C.textLo, marginBottom: 6 }}>
+            <div className="fg-mono" style={{ fontSize: 11, color: day.isToday ? C.accent : C.textLo, marginBottom: 6, fontWeight: day.isToday ? 700 : 400 }}>
               {day.d}
             </div>
             <div
@@ -5571,26 +5581,28 @@ function SquadSessionScreen({
             ))}
           </div>
 
-          {buildSubTab === "Library" && (
-            <LibraryTab
-              onAddToBuild={onAddToBuild}
-              onAddToBurnout={onAddToBurnout}
-              addedIds={new Set(squadSequence.map((b) => b.id))}
-              burnoutIds={new Set(squadBurnout.map((b) => b.id))}
-            />
-          )}
+          <div style={{ flex: 1, overflowY: "auto" }}>
+            {buildSubTab === "Library" && (
+              <LibraryTab
+                onAddToBuild={onAddToBuild}
+                onAddToBurnout={onAddToBurnout}
+                addedIds={new Set(squadSequence.map((b) => b.id))}
+                burnoutIds={new Set(squadBurnout.map((b) => b.id))}
+              />
+            )}
 
-          {buildSubTab === "Builder" && (
-            <BuilderTab
-              buildList={squadSequence}
-              setBuildList={setSquadSequence}
-              burnoutList={squadBurnout}
-              setBurnoutList={setSquadBurnout}
-              config={squadConfig}
-              setConfig={setSquadConfig}
-              onSaveTemplate={onSaveTemplate}
-            />
-          )}
+            {buildSubTab === "Builder" && (
+              <BuilderTab
+                buildList={squadSequence}
+                setBuildList={setSquadSequence}
+                burnoutList={squadBurnout}
+                setBurnoutList={setSquadBurnout}
+                config={squadConfig}
+                setConfig={setSquadConfig}
+                onSaveTemplate={onSaveTemplate}
+              />
+            )}
+          </div>
         </div>
       )}
 
