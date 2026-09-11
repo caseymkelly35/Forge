@@ -121,8 +121,60 @@ async function markOnboarded(token, userId) {
 }
 
 async function fetchProfileExtras(token, userId) {
-  const rows = await supabaseRest(`profiles?id=eq.${userId}&select=has_onboarded,avatar_url`, { token });
-  return rows?.[0] || { has_onboarded: false, avatar_url: null };
+  const rows = await supabaseRest(`profiles?id=eq.${userId}&select=has_onboarded,avatar_url,invite_code`, { token });
+  return rows?.[0] || { has_onboarded: false, avatar_url: null, invite_code: null };
+}
+
+async function ensureInviteCode(token, userId, existingCode) {
+  if (existingCode) return existingCode;
+  const code = Math.random().toString(36).slice(2, 8).toUpperCase();
+  try {
+    await supabaseRest(`profiles?id=eq.${userId}`, { method: "PATCH", token, body: { invite_code: code } });
+    return code;
+  } catch (e) {
+    // astronomically unlikely collision on a 6-char code — just try once more
+    const retry = Math.random().toString(36).slice(2, 8).toUpperCase();
+    await supabaseRest(`profiles?id=eq.${userId}`, { method: "PATCH", token, body: { invite_code: retry } });
+    return retry;
+  }
+}
+
+async function lookupProfileByInviteCode(token, code) {
+  const rows = await supabaseRest("rpc/get_public_profile_by_invite_code", { method: "POST", token, body: { code } });
+  return rows?.[0] || null;
+}
+
+async function createFriendship(token, userIdA, userIdB) {
+  const [ua, ub] = [userIdA, userIdB].sort();
+  try {
+    await supabaseRest("friendships", { method: "POST", token, body: { user_a: ua, user_b: ub } });
+  } catch (e) {
+    // already friends (unique constraint) — treat as success, not an error
+  }
+}
+
+async function fetchFriends(token, userId) {
+  const rows = await supabaseRest(`friendships?select=user_a,user_b&or=(user_a.eq.${userId},user_b.eq.${userId})`, { token });
+  const friendIds = (rows || []).map((r) => (r.user_a === userId ? r.user_b : r.user_a));
+  if (friendIds.length === 0) return [];
+  const profiles = await supabaseRest("rpc/get_friend_profiles", { method: "POST", token, body: { ids: friendIds } });
+  const fiveMinAgo = Date.now() - 5 * 60 * 1000;
+  return (profiles || []).map((p) => ({
+    id: p.id,
+    name: p.name,
+    avatarUrl: p.avatar_url,
+    online: !!(p.last_seen_at && new Date(p.last_seen_at).getTime() > fiveMinAgo),
+    lastSeenAt: p.last_seen_at,
+  }));
+}
+
+async function removeFriendship(token, myId, friendId) {
+  const [ua, ub] = [myId, friendId].sort();
+  await supabaseRest(`friendships?user_a=eq.${ua}&user_b=eq.${ub}`, { method: "DELETE", token });
+}
+
+async function updateLastSeen(token, userId) {
+  await supabaseRest(`profiles?id=eq.${userId}`, { method: "PATCH", token, body: { last_seen_at: new Date().toISOString() } });
 }
 
 async function uploadAvatar(token, userId, file) {
@@ -193,7 +245,7 @@ const FontImport = () => (
 /* ============================================================
    AUTH SCREEN
    ============================================================ */
-function AuthScreen({ onAuthed }) {
+function AuthScreen({ onAuthed, hasPendingInvite }) {
   const [mode, setMode] = useState("welcome"); // welcome | signin | create
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -330,6 +382,18 @@ function AuthScreen({ onAuthed }) {
               Train together. In sync.
             </p>
 
+            {hasPendingInvite && (
+              <div
+                className="fg-mono"
+                style={{
+                  background: `${C.blue}1A`, border: `1px solid ${C.blue}`, borderRadius: 12,
+                  padding: "12px 16px", color: C.accent, fontSize: 13, marginBottom: 24, lineHeight: 1.5,
+                }}
+              >
+                You've been invited to train on FORGE — sign up and you'll connect automatically.
+              </div>
+            )}
+
             <button style={primaryBtn} onClick={() => { setError(""); setMode("create"); }}>
               Create Account
             </button>
@@ -450,6 +514,16 @@ const relativeDay = (ts) => {
   if (diffDays === 1) return "Yesterday";
   return `${diffDays} days ago`;
 };
+
+function lastActiveLabel(online, lastSeenAt) {
+  if (online) return "Online now";
+  if (!lastSeenAt) return "Hasn't opened FORGE yet";
+  const mins = Math.floor((Date.now() - new Date(lastSeenAt).getTime()) / 60000);
+  if (mins < 60) return `Active ${Math.max(mins, 1)}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `Active ${hours}h ago`;
+  return `Active ${Math.floor(hours / 24)}d ago`;
+}
 
 function HomeScreen({ user, history, templates, squadMembers, activeProgramRow, allPrograms, onStartBuild, onLoadTemplate, onStartFreestyle, onOpenHistory, onOpenSocial, onOpenPrograms, onStartTodayWorkout }) {
   const firstName = (user?.name || "Casey").split(" ")[0];
@@ -5019,9 +5093,7 @@ function MemberAvatar({ member, size = 40 }) {
   );
 }
 
-function SocialScreen({ user, history, onBack, onSignOut, onStartSquad, onChangeAvatar }) {
-  const [friends, setFriends] = useState([]);
-  const [requests, setRequests] = useState([]);
+function SocialScreen({ user, history, friends, myInviteCode, onBack, onSignOut, onStartSquad, onChangeAvatar, onRemoveFriend }) {
   const [groups, setGroups] = useState([]);
   const [copied, setCopied] = useState(false);
   const [invitedToast, setInvitedToast] = useState(null);
@@ -5031,10 +5103,8 @@ function SocialScreen({ user, history, onBack, onSignOut, onStartSquad, onChange
   const [avatarError, setAvatarError] = useState("");
   const [showGroupEditor, setShowGroupEditor] = useState(null); // null | { id?, name, memberIds }
   const [viewingGroupId, setViewingGroupId] = useState(null);
+  const [confirmingRemoveId, setConfirmingRemoveId] = useState(null);
   const fileInputRef = useRef(null);
-  const inviteCode = useMemo(() => `FORGE-${(user?.name || "YOU").slice(0, 3).toUpperCase()}${Math.floor(1000 + Math.random() * 9000)}`, [user]);
-  const friendsKey = `social-friends:${user?.id || "anon"}`;
-  const requestsKey = `social-requests:${user?.id || "anon"}`;
   const groupsKey = `social-groups:${user?.id || "anon"}`;
 
   const handleAvatarFileChange = async (e) => {
@@ -5057,34 +5127,23 @@ function SocialScreen({ user, history, onBack, onSignOut, onStartSquad, onChange
 
   useEffect(() => {
     (async () => {
-      const [storedFriends, storedRequests, storedGroups] = await Promise.all([storageGet(friendsKey), storageGet(requestsKey), storageGet(groupsKey)]);
-      if (storedFriends) setFriends(storedFriends);
-      if (storedRequests) setRequests(storedRequests);
+      const storedGroups = await storageGet(groupsKey);
       if (storedGroups) setGroups(storedGroups);
       setSocialHydrated(true);
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user?.id]);
 
-  useEffect(() => { if (socialHydrated) storageSet(friendsKey, friends); }, [friends, socialHydrated, friendsKey]);
-  useEffect(() => { if (socialHydrated) storageSet(requestsKey, requests); }, [requests, socialHydrated, requestsKey]);
   useEffect(() => { if (socialHydrated) storageSet(groupsKey, groups); }, [groups, socialHydrated, groupsKey]);
 
   const handleCopy = () => {
-    const link = `https://forge.app/join/${inviteCode}`;
+    const link = `${window.location.origin}/join/${myInviteCode || ""}`;
     if (navigator.clipboard?.writeText) {
       navigator.clipboard.writeText(link).catch(() => {});
     }
     setCopied(true);
     setTimeout(() => setCopied(false), 1600);
   };
-
-  const acceptRequest = (req) => {
-    setFriends((f) => [...f, { id: req.id, name: req.name, online: false, location: "Just connected", streak: 0 }]);
-    setRequests((r) => r.filter((x) => x.id !== req.id));
-  };
-
-  const declineRequest = (req) => setRequests((r) => r.filter((x) => x.id !== req.id));
 
   const inviteToLift = (friend) => {
     setInvitedToast(friend.name);
@@ -5140,7 +5199,7 @@ function SocialScreen({ user, history, onBack, onSignOut, onStartSquad, onChange
             }}
           >
             <span className="fg-mono" style={{ color: C.textHi, fontSize: 12, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-              forge.app/join/{inviteCode}
+              {myInviteCode ? `${window.location.host}/join/${myInviteCode}` : "Generating your link..."}
             </span>
             <button
               onClick={handleCopy}
@@ -5154,40 +5213,9 @@ function SocialScreen({ user, history, onBack, onSignOut, onStartSquad, onChange
             </button>
           </div>
           <div className="fg-mono" style={{ color: C.textLo, fontSize: 10, lineHeight: 1.4 }}>
-            Invites aren't fully live yet — connections stay on this device until real accounts can link up directly.
+            Anyone who signs up through this link connects with you automatically — no approval step needed.
           </div>
         </div>
-
-        {requests.length > 0 && (
-          <div style={{ marginBottom: 18 }}>
-            <div className="fg-mono" style={{ color: C.amber, fontSize: 12, letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 10 }}>
-              Requests ({requests.length})
-            </div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-              {requests.map((r) => (
-                <div key={r.id} style={{ background: C.bgCard, border: `1px solid ${C.amber}44`, borderRadius: 12, padding: "12px 14px" }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
-                    <Avatar name={r.name} size={36} />
-                    <div style={{ flex: 1 }}>
-                      <div className="fg-display" style={{ color: C.textHi, fontSize: 15, fontWeight: 600 }}>{r.name}</div>
-                      <div className="fg-mono" style={{ color: C.textLo, fontSize: 10 }}>
-                        {r.mutual > 0 ? `${r.mutual} mutual connections` : "New to FORGE"}
-                      </div>
-                    </div>
-                  </div>
-                  <div style={{ display: "flex", gap: 8 }}>
-                    <button onClick={() => declineRequest(r)} className="fg-display" style={{ flex: 1, background: "transparent", border: `1px solid ${C.line}`, borderRadius: 8, padding: "9px", color: C.textLo, fontWeight: 600, fontSize: 13 }}>
-                      Decline
-                    </button>
-                    <button onClick={() => acceptRequest(r)} className="fg-display" style={{ flex: 1, background: C.blue, border: "none", borderRadius: 8, padding: "9px", color: "white", fontWeight: 700, fontSize: 13 }}>
-                      Accept
-                    </button>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
 
         <button
           onClick={onStartSquad}
@@ -5211,35 +5239,51 @@ function SocialScreen({ user, history, onBack, onSignOut, onStartSquad, onChange
           </div>
         ) : (
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-            {friends.map((f) => (
-              <div key={f.id} style={{ display: "flex", alignItems: "center", gap: 12, background: C.bgCard, border: `1px solid ${C.line}`, borderRadius: 12, padding: "12px 14px" }}>
-                <div style={{ position: "relative" }}>
-                  <Avatar name={f.name} />
-                  <div
-                    style={{
-                      position: "absolute", bottom: -1, right: -1, width: 11, height: 11, borderRadius: "50%",
-                      background: f.online ? "#22C55E" : C.textLo, border: `2px solid ${C.bgCard}`,
-                    }}
-                  />
-                </div>
-                <div style={{ flex: 1 }}>
-                  <div className="fg-display" style={{ color: C.textHi, fontSize: 16, fontWeight: 600 }}>{f.name}</div>
-                  <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, marginTop: 2 }}>
-                    {f.location} {f.streak > 0 ? `· ${f.streak}d streak` : ""}
+            {friends.map((f) => {
+              const confirming = confirmingRemoveId === f.id;
+              return (
+                <div key={f.id} style={{ display: "flex", alignItems: "center", gap: 12, background: C.bgCard, border: `1px solid ${confirming ? "#EF4444" : C.line}`, borderRadius: 12, padding: "12px 14px" }}>
+                  <div style={{ position: "relative" }}>
+                    <Avatar name={f.name} url={f.avatarUrl} />
+                    <div
+                      style={{
+                        position: "absolute", bottom: -1, right: -1, width: 11, height: 11, borderRadius: "50%",
+                        background: f.online ? "#22C55E" : C.textLo, border: `2px solid ${C.bgCard}`,
+                      }}
+                    />
                   </div>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div className="fg-display" style={{ color: C.textHi, fontSize: 16, fontWeight: 600 }}>{f.name}</div>
+                    <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, marginTop: 2 }}>
+                      {lastActiveLabel(f.online, f.lastSeenAt)}
+                    </div>
+                  </div>
+                  {confirming ? (
+                    <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+                      <button onClick={() => setConfirmingRemoveId(null)} className="fg-mono" style={{ background: "transparent", border: `1px solid ${C.line}`, borderRadius: 8, padding: "7px 10px", color: C.textLo, fontSize: 11 }}>
+                        Cancel
+                      </button>
+                      <button onClick={() => { onRemoveFriend(f.id); setConfirmingRemoveId(null); }} className="fg-mono" style={{ background: "#EF4444", border: "none", borderRadius: 8, padding: "7px 10px", color: "white", fontSize: 11 }}>
+                        Remove
+                      </button>
+                    </div>
+                  ) : (
+                    <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+                      <button
+                        onClick={() => inviteToLift(f)}
+                        className="fg-display"
+                        style={{ background: `${C.blue}1A`, border: `1px solid ${C.blue}`, borderRadius: 8, padding: "8px 12px", color: C.accent, fontWeight: 600, fontSize: 12 }}
+                      >
+                        Invite to Lift
+                      </button>
+                      <button onClick={() => setConfirmingRemoveId(f.id)} style={{ background: "none", border: "none", padding: 6 }}>
+                        <X size={14} color={C.textLo} />
+                      </button>
+                    </div>
+                  )}
                 </div>
-                <button
-                  onClick={() => inviteToLift(f)}
-                  className="fg-display"
-                  style={{
-                    background: `${C.blue}1A`, border: `1px solid ${C.blue}`, borderRadius: 8,
-                    padding: "8px 12px", color: C.accent, fontWeight: 600, fontSize: 12, flexShrink: 0,
-                  }}
-                >
-                  Invite to Lift
-                </button>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
 
@@ -6453,6 +6497,14 @@ export default function App() {
   const [customPrograms, setCustomPrograms] = useState([]);
   const allPrograms = [...PROGRAMS, ...customPrograms];
   const [avatarUrl, setAvatarUrl] = useState(null);
+  const [myInviteCode, setMyInviteCode] = useState(null);
+  const [friends, setFriends] = useState([]);
+  const [pendingInviteCode] = useState(() => {
+    const m = window.location.pathname.match(/^\/join\/([a-zA-Z0-9]+)$/);
+    return m ? m[1].toUpperCase() : null;
+  });
+  const [inviteBanner, setInviteBanner] = useState(null); // { name } of whoever's link this is, once known
+  const [connectedToast, setConnectedToast] = useState(null);
 
   const user = authSession ? { id: authSession.user.id, name: authSession.user.name || authSession.user.email.split("@")[0], email: authSession.user.email, avatarUrl } : null;
 
@@ -6512,6 +6564,7 @@ export default function App() {
             setAvatarUrl(profileExtras.avatar_url || null);
             setActiveProgramRow(program);
             setCustomPrograms(customProgs);
+            await finishSocialSetup(token, stored.user.id, profileExtras.invite_code);
           } catch (e) {
             setCloudError("Couldn't reach the server — showing what's cached locally.");
           }
@@ -6524,6 +6577,36 @@ export default function App() {
 
   // persist the session itself locally so a refresh doesn't force re-login
   useEffect(() => { if (hydrated) storageSet("auth-session", authSession); }, [authSession, hydrated]);
+
+  // Ensures this account has a real invite code, connects a pending invite
+  // from the URL (if any) to a real friendship, and loads the real friends
+  // list. Shared by both the mount-restore path and a fresh login.
+  const finishSocialSetup = async (token, userId, existingInviteCode) => {
+    const code = await ensureInviteCode(token, userId, existingInviteCode);
+    setMyInviteCode(code);
+
+    if (pendingInviteCode && pendingInviteCode !== code) {
+      try {
+        const inviter = await lookupProfileByInviteCode(token, pendingInviteCode);
+        if (inviter && inviter.id !== userId) {
+          await createFriendship(token, userId, inviter.id);
+          setConnectedToast(inviter.name);
+          setTimeout(() => setConnectedToast(null), 3000);
+        }
+      } catch (e) {
+        // invalid or expired code — fail quietly, nothing to connect
+      } finally {
+        window.history.replaceState({}, "", "/");
+      }
+    }
+
+    updateLastSeen(token, userId).catch(() => {});
+    try {
+      setFriends(await fetchFriends(token, userId));
+    } catch (e) {
+      // friends list just stays empty on failure — not worth a banner for this
+    }
+  };
 
   // whenever someone signs in fresh (not from the mount-restore path), pull their cloud data
   const handleAuthed = async (newSession) => {
@@ -6542,10 +6625,20 @@ export default function App() {
       setAvatarUrl(profileExtras.avatar_url || null);
       setActiveProgramRow(program);
       setCustomPrograms(customProgs);
+      await finishSocialSetup(newSession.access_token, newSession.user.id, profileExtras.invite_code);
     } catch (e) {
       setCloudError("Signed in, but couldn't load your data from the server yet.");
     }
   };
+
+  // heartbeat: keeps "online" status genuinely real for friends looking at
+  // you, not just accurate at the moment you logged in
+  useEffect(() => {
+    if (!authSession) return;
+    const tick = () => updateLastSeen(authSession.access_token, authSession.user.id).catch(() => {});
+    const t = setInterval(tick, 2 * 60 * 1000);
+    return () => clearInterval(t);
+  }, [authSession]);
 
   const signOut = () => {
     setAuthSession(null);
@@ -6555,6 +6648,8 @@ export default function App() {
     setActiveProgramRow(null);
     setAvatarUrl(null);
     setCustomPrograms([]);
+    setFriends([]);
+    setMyInviteCode(null);
     setView("home");
   };
 
@@ -6567,6 +6662,17 @@ export default function App() {
       setAvatarUrl(url);
     } catch (e) {
       setCloudError("Couldn't upload that photo — try a smaller image or check your connection.");
+    }
+  };
+
+  const removeFriend = async (friendId) => {
+    setFriends((list) => list.filter((f) => f.id !== friendId)); // optimistic
+    try {
+      const token = await getValidToken(authSession, setAuthSession);
+      if (!token) throw new Error("Not signed in");
+      await removeFriendship(token, authSession.user.id, friendId);
+    } catch (e) {
+      setCloudError("Removed locally, but couldn't sync to the server.");
     }
   };
 
@@ -6756,7 +6862,7 @@ export default function App() {
 
   if (!hydrated) return <AppLoadingScreen />;
 
-  if (!user) return <AuthScreen onAuthed={handleAuthed} />;
+  if (!user) return <AuthScreen onAuthed={handleAuthed} hasPendingInvite={!!pendingInviteCode} />;
 
   if (needsOnboarding) return <OnboardingTutorialScreen onDone={finishOnboarding} />;
 
@@ -6803,10 +6909,13 @@ export default function App() {
       <SocialScreen
         user={user}
         history={history}
+        friends={friends}
+        myInviteCode={myInviteCode}
         onBack={() => setView("home")}
         onSignOut={signOut}
         onStartSquad={() => setView("squad")}
         onChangeAvatar={changeAvatar}
+        onRemoveFriend={removeFriend}
       />
     );
   } else if (view === "history") {
@@ -6870,6 +6979,19 @@ export default function App() {
       <div key={view} className="fg-screen-in">
         {screen}
       </div>
+      {connectedToast && (
+        <div
+          className="fg-mono fg-fade-in"
+          style={{
+            position: "fixed", top: 20, left: "50%", transform: "translateX(-50%)", zIndex: 210,
+            background: "#16A34A", color: "white", padding: "12px 20px", borderRadius: 12,
+            fontSize: 13, fontWeight: 600, boxShadow: "0 8px 24px rgba(0,0,0,0.4)",
+            display: "flex", alignItems: "center", gap: 8,
+          }}
+        >
+          <Users size={15} /> Connected with {connectedToast}!
+        </div>
+      )}
       {cloudError && (
         <div
           style={{
