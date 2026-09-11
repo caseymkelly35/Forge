@@ -5093,7 +5093,7 @@ function MemberAvatar({ member, size = 40 }) {
   );
 }
 
-function SocialScreen({ user, history, friends, myInviteCode, onBack, onSignOut, onStartSquad, onChangeAvatar, onRemoveFriend }) {
+function SocialScreen({ user, history, friends, myInviteCode, onBack, onSignOut, onStartSquad, onChangeAvatar, onRemoveFriend, onConnectByCode }) {
   const [groups, setGroups] = useState([]);
   const [copied, setCopied] = useState(false);
   const [invitedToast, setInvitedToast] = useState(null);
@@ -5104,6 +5104,9 @@ function SocialScreen({ user, history, friends, myInviteCode, onBack, onSignOut,
   const [showGroupEditor, setShowGroupEditor] = useState(null); // null | { id?, name, memberIds }
   const [viewingGroupId, setViewingGroupId] = useState(null);
   const [confirmingRemoveId, setConfirmingRemoveId] = useState(null);
+  const [friendCode, setFriendCode] = useState("");
+  const [connecting, setConnecting] = useState(false);
+  const [connectError, setConnectError] = useState("");
   const fileInputRef = useRef(null);
   const groupsKey = `social-groups:${user?.id || "anon"}`;
 
@@ -5148,6 +5151,18 @@ function SocialScreen({ user, history, friends, myInviteCode, onBack, onSignOut,
   const inviteToLift = (friend) => {
     setInvitedToast(friend.name);
     setTimeout(() => setInvitedToast(null), 1800);
+  };
+
+  const handleConnectByCode = async () => {
+    setConnectError("");
+    setConnecting(true);
+    const result = await onConnectByCode(friendCode);
+    setConnecting(false);
+    if (result.ok) {
+      setFriendCode("");
+    } else {
+      setConnectError(result.message);
+    }
   };
 
   const inviteGroupToLift = (group) => {
@@ -5215,6 +5230,36 @@ function SocialScreen({ user, history, friends, myInviteCode, onBack, onSignOut,
           <div className="fg-mono" style={{ color: C.textLo, fontSize: 10, lineHeight: 1.4 }}>
             Anyone who signs up through this link connects with you automatically — no approval step needed.
           </div>
+        </div>
+
+        <div style={{ background: C.bgCard, border: `1px solid ${C.line}`, borderRadius: 14, padding: 16, marginBottom: 18 }}>
+          <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, letterSpacing: "0.08em", marginBottom: 10 }}>
+            ALREADY KNOW THEIR CODE?
+          </div>
+          <div style={{ display: "flex", gap: 8 }}>
+            <input
+              value={friendCode}
+              onChange={(e) => { setFriendCode(e.target.value); setConnectError(""); }}
+              onKeyDown={(e) => { if (e.key === "Enter") handleConnectByCode(); }}
+              placeholder="e.g. K7XQ2P"
+              className="fg-mono"
+              style={{ flex: 1, background: C.bg, border: `1px solid ${C.line}`, borderRadius: 10, padding: "11px 14px", color: C.textHi, fontSize: 14, textTransform: "uppercase", outline: "none" }}
+            />
+            <button
+              onClick={handleConnectByCode}
+              disabled={connecting || !friendCode.trim()}
+              className="fg-display"
+              style={{
+                background: C.blue, border: "none", borderRadius: 10, padding: "0 18px", color: "white",
+                fontWeight: 700, fontSize: 14, opacity: connecting || !friendCode.trim() ? 0.5 : 1, flexShrink: 0,
+              }}
+            >
+              {connecting ? "..." : "Connect"}
+            </button>
+          </div>
+          {connectError && (
+            <div className="fg-mono" style={{ color: "#F87171", fontSize: 11, marginTop: 8 }}>{connectError}</div>
+          )}
         </div>
 
         <button
@@ -6581,15 +6626,22 @@ export default function App() {
   // Ensures this account has a real invite code, connects a pending invite
   // from the URL (if any) to a real friendship, and loads the real friends
   // list. Shared by both the mount-restore path and a fresh login.
+  // shared by both the URL-based invite flow and manual code entry below
+  const connectViaCode = async (token, userId, code) => {
+    const inviter = await lookupProfileByInviteCode(token, code);
+    if (!inviter || inviter.id === userId) return null;
+    await createFriendship(token, userId, inviter.id);
+    return inviter;
+  };
+
   const finishSocialSetup = async (token, userId, existingInviteCode) => {
     const code = await ensureInviteCode(token, userId, existingInviteCode);
     setMyInviteCode(code);
 
     if (pendingInviteCode && pendingInviteCode !== code) {
       try {
-        const inviter = await lookupProfileByInviteCode(token, pendingInviteCode);
-        if (inviter && inviter.id !== userId) {
-          await createFriendship(token, userId, inviter.id);
+        const inviter = await connectViaCode(token, userId, pendingInviteCode);
+        if (inviter) {
           setConnectedToast(inviter.name);
           setTimeout(() => setConnectedToast(null), 3000);
         }
@@ -6605,6 +6657,26 @@ export default function App() {
       setFriends(await fetchFriends(token, userId));
     } catch (e) {
       // friends list just stays empty on failure — not worth a banner for this
+    }
+  };
+
+  // manual entry — for connecting with someone who already has an account
+  // but didn't come in through a clicked link (e.g. they just told you their code)
+  const connectByCode = async (rawCode) => {
+    const code = rawCode.trim().toUpperCase();
+    if (!code) return { ok: false, message: "Enter a code first." };
+    if (code === myInviteCode) return { ok: false, message: "That's your own code." };
+    try {
+      const token = await getValidToken(authSession, setAuthSession);
+      if (!token) return { ok: false, message: "Not signed in." };
+      const inviter = await connectViaCode(token, authSession.user.id, code);
+      if (!inviter) return { ok: false, message: "No account found with that code." };
+      setFriends(await fetchFriends(token, authSession.user.id));
+      setConnectedToast(inviter.name);
+      setTimeout(() => setConnectedToast(null), 3000);
+      return { ok: true, name: inviter.name };
+    } catch (e) {
+      return { ok: false, message: "Something went wrong — try again." };
     }
   };
 
@@ -6916,6 +6988,7 @@ export default function App() {
         onStartSquad={() => setView("squad")}
         onChangeAvatar={changeAvatar}
         onRemoveFriend={removeFriend}
+        onConnectByCode={connectByCode}
       />
     );
   } else if (view === "history") {
