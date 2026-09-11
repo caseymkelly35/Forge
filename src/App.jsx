@@ -6486,6 +6486,10 @@ export default function App() {
   const [squadSessionMembers, setSquadSessionMembers] = useState([]);
   const [pendingSquadInvites, setPendingSquadInvites] = useState([]);
 
+  useEffect(() => {
+    storageSet("active-squad-session-id", activeSquadSession?.id || null);
+  }, [activeSquadSession?.id]);
+
   const user = authSession ? { id: authSession.user.id, name: authSession.user.name || authSession.user.email.split("@")[0], email: authSession.user.email, avatarUrl } : null;
 
   // On mount: try to restore a real Supabase session (refreshing the token if
@@ -6512,6 +6516,25 @@ export default function App() {
             setActiveProgramRow(program);
             setCustomPrograms(customProgs);
             await finishSocialSetup(token, stored.user.id, profileExtras.invite_code);
+
+            // rejoin whichever squad session you were in before a refresh —
+            // previously a refresh silently dropped you back to Home with
+            // no way back in, which looked identical to "sync is broken"
+            const storedSessionId = await storageGet("active-squad-session-id");
+            if (storedSessionId) {
+              try {
+                const restoredSession = await fetchSquadSession(token, storedSessionId);
+                if (restoredSession) {
+                  setActiveSquadSession(restoredSession);
+                  setSquadSessionMembers(await fetchSessionMembers(token, storedSessionId));
+                  setView("squad");
+                } else {
+                  storageSet("active-squad-session-id", null);
+                }
+              } catch (e) {
+                // session no longer accessible — just stay on Home
+              }
+            }
           } catch (e) {
             setCloudError("Couldn't reach the server — showing what's cached locally.");
           }
@@ -6802,6 +6825,30 @@ export default function App() {
       );
     })();
     return () => { cancelled = true; if (cleanupFn) cleanupFn(); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeSquadSession?.id]);
+
+  // Backup sync — a safety net alongside the realtime subscription above.
+  // If the live connection ever misses something (or isn't behaving in a
+  // given browser/network), this guarantees the session still catches up
+  // within a few seconds instead of silently drifting out of sync.
+  useEffect(() => {
+    if (!activeSquadSession?.id || !authSession) return;
+    const t = setInterval(async () => {
+      try {
+        const token = await getValidToken(authSession, setAuthSession);
+        if (!token) return;
+        const [freshSession, freshMembers] = await Promise.all([
+          fetchSquadSession(token, activeSquadSession.id),
+          fetchSessionMembers(token, activeSquadSession.id),
+        ]);
+        if (freshSession) setActiveSquadSession((s) => (s ? { ...s, ...freshSession } : s));
+        setSquadSessionMembers(freshMembers);
+      } catch (e) {
+        // a missed poll is fine — the next one will catch up
+      }
+    }, 4000);
+    return () => clearInterval(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeSquadSession?.id]);
 
