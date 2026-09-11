@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useLayoutEffect, useMemo, useRef } from "react";
 import { Dumbbell, Flame, Users, ChevronRight, Play, Pause, Plus, Apple, Chrome, Search, MoreHorizontal, GripVertical, Link2, X, Home as HomeIcon, LayoutList, Save, ArrowLeft, Check, SkipForward, ArrowRight, SplitSquareHorizontal, Trophy, TrendingUp, Activity, Calendar, Copy, UserPlus, LogOut, Mail, MessageCircle, Send, Music, Crown, Zap, Camera } from "lucide-react";
 import { LineChart, Line, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
+import { createClient } from "@supabase/supabase-js";
 
 /* ============================================================
    FORGE — Design tokens
@@ -36,11 +37,15 @@ async function storageSet(key, value) {
 
 /* ============================================================
    SUPABASE — real backend, talked to directly over REST (no SDK,
-   since @supabase/supabase-js isn't available in this environment).
-   Auth uses Supabase's GoTrue REST API; data uses PostgREST.
+   Auth and data continue to use plain REST (GoTrue + PostgREST)
+   exactly as before — nothing about that changes here. The one
+   addition is a real Supabase client, used ONLY for Realtime
+   (live Squad session sync), since that specifically requires a
+   persistent WebSocket connection that plain fetch can't do.
    ============================================================ */
 const SUPABASE_URL = "https://txuxgkqytfrdsxakjziz.supabase.co";
 const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InR4dXhna3F5dGZyZHN4YWtqeml6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODczMzk1NDIsImV4cCI6MjEwMjkxNTU0Mn0.YY42ohOKoo0MZ8bIGGb1q0RLUUYm9m-9c9cscrCI_Fo";
+const supabaseRealtime = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, { auth: { persistSession: false, autoRefreshToken: false } });
 
 function friendlyAuthError(data, status) {
   const msg = data?.error_description || data?.msg || data?.error || data?.message || "";
@@ -175,6 +180,119 @@ async function removeFriendship(token, myId, friendId) {
 
 async function updateLastSeen(token, userId) {
   await supabaseRest(`profiles?id=eq.${userId}`, { method: "PATCH", token, body: { last_seen_at: new Date().toISOString() } });
+}
+
+/* ============================================================
+   REAL SQUAD SESSIONS (Phase 3a)
+   ============================================================ */
+function dbSquadSessionToLocal(row) {
+  return {
+    id: row.id,
+    hostId: row.host_id,
+    name: row.name,
+    config: row.config,
+    buildItems: row.build_items || [],
+    burnoutItems: row.burnout_items || [],
+    status: row.status,
+  };
+}
+
+async function createSquadSession(token, hostId, name) {
+  const [row] = await supabaseRest("squad_sessions", { method: "POST", token, body: { host_id: hostId, name } });
+  // the host is automatically a joined member of their own session
+  await supabaseRest("squad_session_members", { method: "POST", token, body: { session_id: row.id, user_id: hostId, status: "joined" } });
+  return dbSquadSessionToLocal(row);
+}
+
+async function inviteToSquadSession(token, sessionId, userIds) {
+  if (!userIds.length) return;
+  await supabaseRest("squad_session_members", {
+    method: "POST",
+    token,
+    body: userIds.map((userId) => ({ session_id: sessionId, user_id: userId, status: "invited" })),
+  });
+}
+
+async function fetchPendingInvites(token, userId) {
+  const rows = await supabaseRest(`squad_session_members?select=*,squad_sessions(*)&user_id=eq.${userId}&status=eq.invited`, { token });
+  const hostIds = [...new Set((rows || []).map((r) => r.squad_sessions?.host_id).filter(Boolean))];
+  let hostProfiles = [];
+  if (hostIds.length) hostProfiles = await supabaseRest("rpc/get_friend_profiles", { method: "POST", token, body: { ids: hostIds } });
+  const hostById = Object.fromEntries((hostProfiles || []).map((p) => [p.id, p]));
+  return (rows || [])
+    .filter((r) => r.squad_sessions)
+    .map((r) => ({
+      membershipId: r.id,
+      session: dbSquadSessionToLocal(r.squad_sessions),
+      hostName: hostById[r.squad_sessions.host_id]?.name || "Someone",
+    }));
+}
+
+async function joinSquadSession(token, sessionId, userId) {
+  await supabaseRest(`squad_session_members?session_id=eq.${sessionId}&user_id=eq.${userId}`, { method: "PATCH", token, body: { status: "joined" } });
+}
+
+async function leaveSquadSession(token, sessionId, userId) {
+  await supabaseRest(`squad_session_members?session_id=eq.${sessionId}&user_id=eq.${userId}`, { method: "DELETE", token });
+}
+
+async function fetchSquadSession(token, sessionId) {
+  const rows = await supabaseRest(`squad_sessions?id=eq.${sessionId}&select=*`, { token });
+  return rows?.[0] ? dbSquadSessionToLocal(rows[0]) : null;
+}
+
+async function updateSharedBuild(token, sessionId, patch) {
+  const body = {};
+  if ("config" in patch) body.config = patch.config;
+  if ("buildItems" in patch) body.build_items = patch.buildItems;
+  if ("burnoutItems" in patch) body.burnout_items = patch.burnoutItems;
+  await supabaseRest(`squad_sessions?id=eq.${sessionId}`, { method: "PATCH", token, body });
+}
+
+async function fetchSessionMembers(token, sessionId) {
+  const rows = await supabaseRest(`squad_session_members?session_id=eq.${sessionId}&select=*`, { token });
+  const ids = (rows || []).map((r) => r.user_id);
+  if (!ids.length) return [];
+  const profiles = await supabaseRest("rpc/get_friend_profiles", { method: "POST", token, body: { ids } });
+  const profileById = Object.fromEntries((profiles || []).map((p) => [p.id, p]));
+  const fiveMinAgo = Date.now() - 5 * 60 * 1000;
+  return (rows || []).map((r) => {
+    const p = profileById[r.user_id] || {};
+    return {
+      id: r.user_id,
+      name: p.name || "Member",
+      avatarUrl: p.avatar_url,
+      status: r.status,
+      online: !!(p.last_seen_at && new Date(p.last_seen_at).getTime() > fiveMinAgo),
+      startIndex: r.start_index,
+      currentIndex: r.current_index,
+      completedCount: r.completed_count,
+    };
+  });
+}
+
+async function updateMemberProgress(token, sessionId, userId, patch) {
+  const body = {};
+  if ("startIndex" in patch) body.start_index = patch.startIndex;
+  if ("currentIndex" in patch) body.current_index = patch.currentIndex;
+  if ("completedCount" in patch) body.completed_count = patch.completedCount;
+  await supabaseRest(`squad_session_members?session_id=eq.${sessionId}&user_id=eq.${userId}`, { method: "PATCH", token, body });
+}
+
+// Live sync — the one thing plain fetch can't do. Call the returned
+// unsubscribe function when leaving the session screen.
+function subscribeToSquadSession(token, sessionId, onSessionChange, onMembersChange) {
+  supabaseRealtime.realtime.setAuth(token);
+  const channel = supabaseRealtime
+    .channel(`squad-session-${sessionId}`)
+    .on("postgres_changes", { event: "*", schema: "public", table: "squad_sessions", filter: `id=eq.${sessionId}` }, (payload) => {
+      if (payload.new) onSessionChange(dbSquadSessionToLocal(payload.new));
+    })
+    .on("postgres_changes", { event: "*", schema: "public", table: "squad_session_members", filter: `session_id=eq.${sessionId}` }, () => {
+      onMembersChange();
+    })
+    .subscribe();
+  return () => supabaseRealtime.removeChannel(channel);
 }
 
 async function uploadAvatar(token, userId, file) {
@@ -525,9 +643,9 @@ function lastActiveLabel(online, lastSeenAt) {
   return `Active ${Math.floor(hours / 24)}d ago`;
 }
 
-function HomeScreen({ user, history, templates, squadMembers, activeProgramRow, allPrograms, onStartBuild, onLoadTemplate, onStartFreestyle, onOpenHistory, onOpenSocial, onOpenPrograms, onStartTodayWorkout }) {
+function HomeScreen({ user, history, templates, friends, activeProgramRow, allPrograms, onStartBuild, onLoadTemplate, onStartFreestyle, onOpenHistory, onOpenSocial, onOpenPrograms, onStartTodayWorkout }) {
   const firstName = (user?.name || "Casey").split(" ")[0];
-  const onlinePartner = (squadMembers || []).find((m) => !m.isMe && m.online);
+  const onlinePartner = (friends || []).find((f) => f.online);
   const recentSessions = (history || []).slice(0, 3).map((s) => ({
     name: s.source === "freestyle" ? "Freestyle Session" : `${s.mode} Workout`,
     when: relativeDay(s.date),
@@ -678,23 +796,13 @@ function HomeScreen({ user, history, templates, squadMembers, activeProgramRow, 
           }}
         >
           <div style={{ position: "relative" }}>
-            <div
-              style={{
-                width: 44,
-                height: 44,
-                borderRadius: "50%",
-                background: onlinePartner ? `linear-gradient(135deg, ${onlinePartner.color[0]}, ${onlinePartner.color[1]})` : `linear-gradient(135deg, ${C.line}, ${C.textLo})`,
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-              }}
-            >
-              {onlinePartner ? (
-                <span className="fg-display" style={{ color: C.bg, fontWeight: 700, fontSize: 18 }}>{onlinePartner.name[0]}</span>
-              ) : (
+            {onlinePartner ? (
+              <Avatar name={onlinePartner.name} url={onlinePartner.avatarUrl} size={44} />
+            ) : (
+              <div style={{ width: 44, height: 44, borderRadius: "50%", background: `linear-gradient(135deg, ${C.line}, ${C.textLo})`, display: "flex", alignItems: "center", justifyContent: "center" }}>
                 <Users size={20} color={C.bg} />
-              )}
-            </div>
+              </div>
+            )}
             <div
               style={{
                 position: "absolute",
@@ -713,7 +821,7 @@ function HomeScreen({ user, history, templates, squadMembers, activeProgramRow, 
               {onlinePartner ? `${onlinePartner.name} is online` : "No one's online right now"}
             </div>
             <div className="fg-mono" style={{ color: C.textLo, fontSize: 12 }}>
-              {onlinePartner ? "In the squad · tap to join or check in" : "Head to Social to start a squad session"}
+              {onlinePartner ? "Head to Social to invite them to a squad session" : "Head to Social to start a squad session"}
             </div>
           </div>
           <ChevronRight size={18} color={C.textLo} />
@@ -2856,8 +2964,6 @@ function buildTimeline(buildList, burnoutList, config) {
   return phases;
 }
 
-const MOCK_PARTNER_QUEUE = ["Romanian Deadlift", "Plank", "Kettlebell Swing", "Downward Dog"];
-
 function MuscleFigurePlaceholder({ active, size = 140, tint, pulse }) {
   return (
     <div
@@ -3018,7 +3124,6 @@ function ActiveWorkoutScreen({ buildList, burnoutList, config, squadInfo, onExit
   const [idx, setIdx] = useState(0);
   const [remaining, setRemaining] = useState(timeline[0]?.duration ?? null);
   const [running, setRunning] = useState(true);
-  const [showPartner, setShowPartner] = useState(false);
   const [finished, setFinished] = useState(false);
   const [showRestLog, setShowRestLog] = useState(false);
   const [sessionLog, setSessionLog] = useState([]);
@@ -3099,7 +3204,6 @@ function ActiveWorkoutScreen({ buildList, burnoutList, config, squadInfo, onExit
 
   const isBurnout = phase.stage === "burnout";
   const themeColor = isBurnout ? C.amber : C.blue;
-  const partnerExercise = MOCK_PARTNER_QUEUE[idx % MOCK_PARTNER_QUEUE.length];
 
   const pills = (
     <div style={{ display: "flex", gap: 6, justifyContent: "center", marginBottom: 18 }}>
@@ -3125,9 +3229,7 @@ function ActiveWorkoutScreen({ buildList, burnoutList, config, squadInfo, onExit
       <div className="fg-mono" style={{ color: isBurnout ? C.amber : C.textLo, fontSize: 11, letterSpacing: "0.1em", textTransform: "uppercase" }}>
         {isBurnout ? "Burnout" : `Round ${phase.round} / ${phase.totalRounds}`}
       </div>
-      <button onClick={() => setShowPartner((s) => !s)} style={{ background: "none", border: "none" }}>
-        <SplitSquareHorizontal size={20} color={showPartner ? C.accent : C.textLo} />
-      </button>
+      <div style={{ width: 22 }} />
     </div>
   );
 
@@ -3234,7 +3336,7 @@ function ActiveWorkoutScreen({ buildList, burnoutList, config, squadInfo, onExit
 
         <div
           style={{
-            flex: showPartner ? "0 0 auto" : 1,
+            flex: 1,
             borderRadius: 16,
             background: `${themeColor}0D`,
             border: `1px solid ${themeColor}44`,
@@ -3242,7 +3344,7 @@ function ActiveWorkoutScreen({ buildList, burnoutList, config, squadInfo, onExit
             alignItems: "center",
             justifyContent: "center",
             marginBottom: 18,
-            minHeight: showPartner ? 150 : 220,
+            minHeight: 220,
             position: "relative",
             overflow: "hidden",
           }}
@@ -3266,38 +3368,6 @@ function ActiveWorkoutScreen({ buildList, burnoutList, config, squadInfo, onExit
             </div>
           )}
         </div>
-
-        {showPartner && (
-          <div style={{ display: "flex", gap: 10, overflowX: "auto", marginBottom: 18, paddingBottom: 2 }}>
-            {SQUAD_MEMBERS_SEED.filter((m) => !m.isMe).map((m, mi) => (
-              <div
-                key={m.id}
-                style={{
-                  borderRadius: 14,
-                  background: C.bgCard,
-                  border: `1px solid ${C.line}`,
-                  padding: 14,
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 10,
-                  flexShrink: 0,
-                  minWidth: 170,
-                }}
-              >
-                <div style={{ position: "relative", flexShrink: 0 }}>
-                  <MemberAvatar member={m} size={36} />
-                  <div style={{ position: "absolute", bottom: -1, right: -1, width: 9, height: 9, borderRadius: "50%", background: m.online ? "#22C55E" : C.textLo, border: `2px solid ${C.bgCard}` }} />
-                </div>
-                <div style={{ minWidth: 0 }}>
-                  <div className="fg-mono" style={{ color: C.textLo, fontSize: 9, letterSpacing: "0.06em", textTransform: "uppercase" }}>{m.name} · independent</div>
-                  <div className="fg-display" style={{ color: C.textHi, fontSize: 14, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                    {MOCK_PARTNER_QUEUE[(idx + mi) % MOCK_PARTNER_QUEUE.length]}
-                  </div>
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
 
         <div className="fg-display" style={{ color: C.textHi, fontSize: 28, fontWeight: 700, textAlign: "center" }}>
           {phase.exercise.name}
@@ -5093,7 +5163,7 @@ function MemberAvatar({ member, size = 40 }) {
   );
 }
 
-function SocialScreen({ user, history, friends, myInviteCode, onBack, onSignOut, onStartSquad, onChangeAvatar, onRemoveFriend, onConnectByCode }) {
+function SocialScreen({ user, history, friends, myInviteCode, pendingSquadInvites, onBack, onSignOut, onStartSquad, onChangeAvatar, onRemoveFriend, onConnectByCode, onAcceptSquadInvite, onDeclineSquadInvite }) {
   const [groups, setGroups] = useState([]);
   const [copied, setCopied] = useState(false);
   const [invitedToast, setInvitedToast] = useState(null);
@@ -5261,6 +5331,30 @@ function SocialScreen({ user, history, friends, myInviteCode, onBack, onSignOut,
             <div className="fg-mono" style={{ color: "#F87171", fontSize: 11, marginTop: 8 }}>{connectError}</div>
           )}
         </div>
+
+        {pendingSquadInvites && pendingSquadInvites.length > 0 && (
+          <div style={{ marginBottom: 18 }}>
+            <div className="fg-mono" style={{ color: C.amber, fontSize: 12, letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 10 }}>
+              Squad Invites ({pendingSquadInvites.length})
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {pendingSquadInvites.map((invite) => (
+                <div key={invite.session.id} style={{ background: C.bgCard, border: `1px solid ${C.amber}44`, borderRadius: 12, padding: "12px 14px" }}>
+                  <div className="fg-display" style={{ color: C.textHi, fontSize: 15, fontWeight: 600, marginBottom: 2 }}>{invite.session.name}</div>
+                  <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, marginBottom: 10 }}>{invite.hostName} invited you to train together</div>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button onClick={() => onDeclineSquadInvite(invite.session)} className="fg-display" style={{ flex: 1, background: "transparent", border: `1px solid ${C.line}`, borderRadius: 8, padding: "9px", color: C.textLo, fontWeight: 600, fontSize: 13 }}>
+                      Decline
+                    </button>
+                    <button onClick={() => onAcceptSquadInvite(invite.session)} className="fg-display" style={{ flex: 1, background: C.blue, border: "none", borderRadius: 8, padding: "9px", color: "white", fontWeight: 700, fontSize: 13 }}>
+                      Join
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
 
         <button
           onClick={onStartSquad}
@@ -5579,29 +5673,6 @@ function SocialScreen({ user, history, friends, myInviteCode, onBack, onSignOut,
    wrapping back to 0 at the end — so members starting mid-list loop
    around until they've hit every station once (one "round").
    ============================================================ */
-const SQUAD_MEMBERS_SEED = [
-  { id: "me", name: "You", isMe: true, color: [C.blue, C.accent], online: true, startIndex: 0, currentIndex: 0, completedCount: 0, streak: 5 },
-  { id: "f1", name: "Jess", isMe: false, color: ["#8B5CF6", "#C4B5FD"], online: true, startIndex: 1, currentIndex: 1, completedCount: 3, streak: 5 },
-  { id: "f2", name: "Marcus", isMe: false, color: [C.amber, "#FCD34D"], online: true, startIndex: 2, currentIndex: 3, completedCount: 5, streak: 2 },
-  { id: "f3", name: "Priya", isMe: false, color: ["#16A34A", "#4ADE80"], online: false, startIndex: 3, currentIndex: 3, completedCount: 1, streak: 3 },
-];
-
-const squadStationName = (sequence, index) => (sequence.length ? sequence[((index % sequence.length) + sequence.length) % sequence.length]?.name : "—");
-
-const chatRelativeTime = (ts) => {
-  const diffMin = Math.floor((Date.now() - ts) / 60000);
-  if (diffMin < 1) return "now";
-  if (diffMin < 60) return `${diffMin}m ago`;
-  return `${Math.floor(diffMin / 60)}h ago`;
-};
-
-const SQUAD_CHAT_SEED = [
-  { id: "c1", from: "Jess", text: "Squats today are brutal 😤", mine: false, at: Date.now() - 1000 * 60 * 12 },
-  { id: "c2", from: "Marcus", text: "Same, on my last set of pull-ups", mine: false, at: Date.now() - 1000 * 60 * 8 },
-  { id: "c3", from: "You", text: "Let's go! 💪", mine: true, at: Date.now() - 1000 * 60 * 6 },
-];
-
-const QUICK_REPLIES = ["💪 Nice set!", "🔥 Let's go!", "Almost there", "Need a minute", "One more round"];
 
 function useMetronomeClick(bpm, playing) {
   const ctxRef = useRef(null);
@@ -5675,62 +5746,40 @@ function SquadAudioBar({ bpm, onBpmChange, playing, onTogglePlay }) {
 }
 
 function SquadSessionScreen({
-  onBack,
-  squadSequence, setSquadSequence,
-  squadBurnout, setSquadBurnout,
-  squadConfig, setSquadConfig,
-  squadMembers,
-  onAddToBuild, onAddToBurnout,
-  onAutoAssignStarts, onAssignStart, onAdvanceMe, onResetRotation,
-  onStartSquadWorkout, onSaveTemplate,
+  session, members, myId, friends,
+  onAddToBuild, onAddToBurnout, onSetBuildList, onSetBurnoutList, onUpdateConfig,
+  onInviteFriends, onStartWorkout, onAdvanceMe, onLeaveSession, onBack,
 }) {
+  const [tab, setTab] = useState("Roster");
   const [buildSubTab, setBuildSubTab] = useState("Library");
-  const [chat, setChat] = useState(SQUAD_CHAT_SEED);
-  const [chatText, setChatText] = useState("");
-  const chatScrollRef = useRef(null);
-  const [showBuildTogether, setShowBuildTogether] = useState(false);
-  const [showChat, setShowChat] = useState(false);
-  const [lastSeenChatCount, setLastSeenChatCount] = useState(SQUAD_CHAT_SEED.length);
-
-  useEffect(() => {
-    if (chatScrollRef.current) chatScrollRef.current.scrollTo({ top: chatScrollRef.current.scrollHeight, behavior: "smooth" });
-  }, [chat, showChat]);
+  const [showInvite, setShowInvite] = useState(null);
+  const [selectedIds, setSelectedIds] = useState([]);
+  const [previewing, setPreviewing] = useState(false);
+  const [doneFlash, setDoneFlash] = useState(false);
   const [bpm, setBpm] = useState(128);
   const [playing, setPlaying] = useState(false);
-  const [assigningMember, setAssigningMember] = useState(null);
-  const [doneFlash, setDoneFlash] = useState(false);
-  const [previewing, setPreviewing] = useState(false);
-  const roomCode = useMemo(() => `SQD-${Math.floor(1000 + Math.random() * 9000)}`, []);
 
-  const sendChat = (text) => {
-    if (!text.trim()) return;
-    setChat((c) => [...c, { id: `c_${Date.now()}`, from: "You", text, mine: true, at: Date.now() }]);
-    setChatText("");
-  };
+  const buildItems = session.buildItems || [];
+  const burnoutItems = session.burnoutItems || [];
+  const config = session.config;
+  const n = buildItems.length;
+  const me = members.find((m) => m.id === myId);
+  const availableFriends = (friends || []).filter((f) => !members.some((m) => m.id === f.id));
 
-  const openChat = () => {
-    setShowChat(true);
-    setLastSeenChatCount(chat.length);
-  };
-
-  const unreadChat = chat.length - lastSeenChatCount;
-
-  const n = squadSequence.length;
-  const me = squadMembers.find((m) => m.isMe);
-  const leaderboard = [...squadMembers]
-    .map((m) => ({ ...m, points: m.completedCount * 10 + m.streak * 5 }))
-    .sort((a, b) => b.points - a.points);
+  const setBuildList = (updater) => onSetBuildList(typeof updater === "function" ? updater(buildItems) : updater);
+  const setBurnoutList = (updater) => onSetBurnoutList(typeof updater === "function" ? updater(burnoutItems) : updater);
+  const setConfig = (updater) => onUpdateConfig(typeof updater === "function" ? updater(config) : updater);
 
   if (previewing) {
     const startAt = me ? me.currentIndex % Math.max(1, n) : 0;
-    const rotated = n > 0 ? [...squadSequence.slice(startAt), ...squadSequence.slice(0, startAt)] : [];
+    const rotated = n > 0 ? [...buildItems.slice(startAt), ...buildItems.slice(0, startAt)] : [];
     return (
       <WorkoutPreviewScreen
         buildList={rotated}
-        burnoutList={squadBurnout}
-        config={squadConfig}
+        burnoutList={burnoutItems}
+        config={config}
         onBack={() => setPreviewing(false)}
-        onConfirm={onStartSquadWorkout}
+        onConfirm={() => onStartWorkout({ buildList: rotated, burnoutList: burnoutItems, config })}
       />
     );
   }
@@ -5745,203 +5794,103 @@ function SquadSessionScreen({
             <ArrowLeft size={20} color={C.textLo} />
           </button>
           <div>
-            <h1 className="fg-display" style={{ color: C.textHi, fontSize: 24, fontWeight: 700, margin: 0 }}>Squad Session</h1>
-            <div className="fg-mono" style={{ color: C.textLo, fontSize: 11 }}>Room {roomCode} · {squadMembers.filter((m) => m.online).length} online</div>
+            <h1 className="fg-display" style={{ color: C.textHi, fontSize: 22, fontWeight: 700, margin: 0 }}>{session.name}</h1>
+            <div className="fg-mono" style={{ color: C.textLo, fontSize: 11 }}>
+              {members.filter((m) => m.status === "joined").length} joined
+              {members.filter((m) => m.status === "invited").length > 0 ? ` · ${members.filter((m) => m.status === "invited").length} invited` : ""}
+            </div>
           </div>
         </div>
+        <button onClick={onLeaveSession} className="fg-mono" style={{ background: "none", border: `1px solid ${C.line}`, borderRadius: 8, padding: "7px 12px", color: C.textLo, fontSize: 11 }}>
+          Leave
+        </button>
       </div>
 
-      <SquadAudioBar
-        bpm={bpm}
-        onBpmChange={setBpm}
-        playing={playing}
-        onTogglePlay={() => setPlaying((p) => !p)}
-      />
+      <SquadAudioBar bpm={bpm} onBpmChange={setBpm} playing={playing} onTogglePlay={() => setPlaying((p) => !p)} />
 
-      {/* two clear secondary actions, not co-equal tabs — Roster is the one primary view */}
       <div style={{ display: "flex", gap: 8, padding: "12px 20px 0" }}>
         <button
-          onClick={() => setShowBuildTogether(true)}
+          onClick={() => setTab("Roster")}
           className="fg-display"
-          style={{
-            flex: 1, padding: "12px 0", borderRadius: 10, border: `1px solid ${C.line}`, background: C.bgCard,
-            color: C.textHi, fontWeight: 600, fontSize: 14, display: "flex", alignItems: "center", justifyContent: "center", gap: 6,
-          }}
+          style={{ flex: 1, padding: "11px 0", borderRadius: 10, border: `1px solid ${tab === "Roster" ? C.blue : C.line}`, background: tab === "Roster" ? `${C.blue}1A` : "transparent", color: tab === "Roster" ? C.accent : C.textLo, fontWeight: 600, fontSize: 14 }}
         >
-          <LayoutList size={15} /> Build Together
+          Roster
         </button>
         <button
-          onClick={openChat}
+          onClick={() => setTab("Build")}
           className="fg-display"
-          style={{
-            flex: 1, padding: "12px 0", borderRadius: 10, border: `1px solid ${C.line}`, background: C.bgCard,
-            color: C.textHi, fontWeight: 600, fontSize: 14, display: "flex", alignItems: "center", justifyContent: "center", gap: 6, position: "relative",
-          }}
+          style={{ flex: 1, padding: "11px 0", borderRadius: 10, border: `1px solid ${tab === "Build" ? C.blue : C.line}`, background: tab === "Build" ? `${C.blue}1A` : "transparent", color: tab === "Build" ? C.accent : C.textLo, fontWeight: 600, fontSize: 14 }}
         >
-          <MessageCircle size={15} /> Chat
-          {unreadChat > 0 && (
-            <span style={{ position: "absolute", top: 6, right: "28%", width: 8, height: 8, borderRadius: "50%", background: C.amber }} />
-          )}
+          Build Together
         </button>
       </div>
 
-      {/* ===== ROSTER (the one primary view) ===== */}
-      <div style={{ padding: "18px 20px 20px", flex: 1 }}>
-        {leaderboard.some((m) => m.points > 0) && (
-          <div style={{ display: "flex", gap: 8, marginBottom: 18, overflowX: "auto" }}>
-            {leaderboard.slice(0, 3).map((m, i) => (
-              <div key={m.id} style={{ flex: 1, minWidth: 100, background: C.bgCard, border: `1px solid ${i === 0 ? C.amber : C.line}`, borderRadius: 12, padding: "10px 12px", display: "flex", alignItems: "center", gap: 8 }}>
-                {i === 0 ? <Crown size={13} color={C.amber} /> : <span className="fg-mono" style={{ color: C.textLo, fontSize: 11 }}>{i + 1}</span>}
-                <div style={{ minWidth: 0, flex: 1 }}>
-                  <div className="fg-display" style={{ color: C.textHi, fontSize: 12, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{m.name}</div>
-                  <div className="fg-mono" style={{ color: C.accent, fontSize: 10, display: "flex", alignItems: "center", gap: 3 }}><Zap size={9} /> {m.points}</div>
+      {tab === "Roster" && (
+        <div style={{ padding: "18px 20px 20px", flex: 1, overflowY: "auto" }}>
+          <button
+            onClick={() => setShowInvite(true)}
+            className="fg-display"
+            style={{ width: "100%", background: `${C.blue}1A`, border: `1px solid ${C.blue}`, borderRadius: 12, padding: "13px", color: C.accent, fontWeight: 700, fontSize: 14, marginBottom: 18, display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}
+          >
+            <UserPlus size={16} /> Invite People
+          </button>
+
+          <div className="fg-mono" style={{ color: C.textLo, fontSize: 12, letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 10 }}>Squad</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 20 }}>
+            {members.map((m) => (
+              <div key={m.id} style={{ background: C.bgCard, border: `1px solid ${C.line}`, borderRadius: 14, padding: 14, display: "flex", alignItems: "center", gap: 12 }}>
+                <div style={{ position: "relative" }}>
+                  <Avatar name={m.name} url={m.avatarUrl} size={42} />
+                  {m.status === "joined" && (
+                    <div style={{ position: "absolute", bottom: -1, right: -1, width: 11, height: 11, borderRadius: "50%", background: m.online ? "#22C55E" : C.textLo, border: `2px solid ${C.bgCard}` }} />
+                  )}
+                </div>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div className="fg-display" style={{ color: C.textHi, fontSize: 16, fontWeight: 600 }}>
+                    {m.name} {m.id === myId && <span className="fg-mono" style={{ color: C.textLo, fontSize: 10 }}>(you)</span>}
+                  </div>
+                  <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, marginTop: 2 }}>
+                    {m.status === "invited" ? "Invited — waiting to join" : n > 0 ? `Station ${(m.currentIndex % n) + 1} of ${n} · ${m.completedCount} done` : "No stations yet"}
+                  </div>
                 </div>
               </div>
             ))}
           </div>
-        )}
 
-        {n === 0 ? (
-          <div className="fg-mono" style={{ color: C.textLo, fontSize: 13, textAlign: "center", padding: 30, border: `1px dashed ${C.line}`, borderRadius: 12, marginBottom: 20 }}>
-            Tap "Build Together" above to add exercises, then come back here to set starting positions.
-          </div>
-        ) : (
-          <>
-            {/* station rotation assignment */}
-            <div style={{ background: C.bgCard, border: `1px solid ${C.line}`, borderRadius: 14, padding: 16, marginBottom: 18 }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
-                <div className="fg-display" style={{ color: C.textHi, fontSize: 16, fontWeight: 700 }}>Station Rotation</div>
-                <div style={{ display: "flex", gap: 6 }}>
-                  <button
-                    onClick={onResetRotation}
-                    className="fg-mono"
-                    style={{ background: "transparent", border: `1px solid ${C.line}`, borderRadius: 8, padding: "6px 10px", color: C.textLo, fontSize: 11 }}
-                  >
-                    Reset
-                  </button>
-                  <button
-                    onClick={onAutoAssignStarts}
-                    className="fg-mono"
-                    style={{ background: `${C.blue}1A`, border: `1px solid ${C.blue}`, borderRadius: 8, padding: "6px 10px", color: C.accent, fontSize: 11 }}
-                  >
-                    Auto-Assign Starts
-                  </button>
-                </div>
-              </div>
-              <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, marginBottom: 12, lineHeight: 1.5 }}>
-                {assigningMember ? `Tap a station to start ${assigningMember} there.` : "Tap a member below, then tap a station to set their starting point."}
-              </div>
-              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                {squadSequence.map((st, i) => {
-                  const here = squadMembers.filter((m) => m.currentIndex % n === i);
-                  return (
-                    <div
-                      key={st.uid}
-                      onClick={() => { if (assigningMember) { onAssignStart(assigningMember, i); setAssigningMember(null); } }}
-                      style={{
-                        display: "flex", alignItems: "center", gap: 10, padding: "9px 10px", borderRadius: 8,
-                        background: assigningMember ? `${C.blue}0F` : "transparent",
-                        border: `1px solid ${assigningMember ? C.blue + "55" : "transparent"}`,
-                        cursor: assigningMember ? "pointer" : "default",
-                      }}
-                    >
-                      <span className="fg-mono" style={{ color: C.textLo, fontSize: 11, width: 16 }}>{i + 1}</span>
-                      <span className="fg-display" style={{ color: C.textHi, fontSize: 14, fontWeight: 600, flex: 1 }}>{st.name}</span>
-                      <div style={{ display: "flex", gap: 3 }}>
-                        {here.map((m) => (
-                          <div key={m.id} title={m.name}>
-                            <MemberAvatar member={m} size={18} />
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
+          {n === 0 ? (
+            <div className="fg-mono" style={{ color: C.textLo, fontSize: 13, textAlign: "center", padding: 30, border: `1px dashed ${C.line}`, borderRadius: 12 }}>
+              Tap "Build Together" above to add exercises — everyone in this session will see them appear live.
             </div>
-
-            {/* your turn */}
-            {me && (
-              <div style={{ background: `${C.blue}14`, border: `1px solid ${C.blue}`, borderRadius: 14, padding: 16, marginBottom: 18 }}>
-                <div className="fg-mono" style={{ color: C.accent, fontSize: 11, letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: 6 }}>Your Station</div>
-                <div className="fg-display" style={{ color: C.textHi, fontSize: 22, fontWeight: 700, marginBottom: 4 }}>{squadStationName(squadSequence, me.currentIndex)}</div>
-                <div className="fg-mono" style={{ color: C.textLo, fontSize: 12, marginBottom: 14 }}>
-                  Round {Math.floor(me.completedCount / n) + 1} · {me.completedCount % n} of {n} stations this round
-                </div>
-                <div style={{ display: "flex", gap: 10 }}>
-                  <button
-                    onClick={() => { onAdvanceMe(); setDoneFlash(true); setTimeout(() => setDoneFlash(false), 1000); }}
-                    className="fg-display"
-                    style={{ flex: 1, background: doneFlash ? "#16A34A" : C.blue, border: "none", borderRadius: 10, padding: "13px", color: "white", fontWeight: 700, fontSize: 14, display: "flex", alignItems: "center", justifyContent: "center", gap: 6, transition: "background 0.2s" }}
-                  >
-                    {doneFlash ? <Check size={15} /> : null} {doneFlash ? "Nice work!" : "Done"} {!doneFlash && <ArrowRight size={15} />}
-                  </button>
-                  <button
-                    onClick={() => setPreviewing(true)}
-                    className="fg-display"
-                    style={{ flex: 1, background: "#16A34A", border: "none", borderRadius: 10, padding: "13px", color: "white", fontWeight: 700, fontSize: 14 }}
-                  >
-                    Start Workout
-                  </button>
-                </div>
+          ) : me ? (
+            <div style={{ background: `${C.blue}14`, border: `1px solid ${C.blue}`, borderRadius: 14, padding: 16 }}>
+              <div className="fg-mono" style={{ color: C.accent, fontSize: 11, letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: 6 }}>Your Station</div>
+              <div className="fg-display" style={{ color: C.textHi, fontSize: 22, fontWeight: 700, marginBottom: 4 }}>
+                {buildItems[me.currentIndex % n]?.name || "Exercise"}
               </div>
-            )}
-          </>
-        )}
-
-        <div className="fg-mono" style={{ color: C.textLo, fontSize: 12, letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 10 }}>Squad</div>
-        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-          {squadMembers.map((m) => (
-            <div key={m.id} style={{ background: C.bgCard, border: `1px solid ${C.line}`, borderRadius: 14, padding: 14, display: "flex", alignItems: "center", gap: 12 }}>
-              <div
-                onClick={() => !m.isMe && n > 0 && setAssigningMember(assigningMember === m.id ? null : m.id)}
-                style={{ position: "relative", cursor: !m.isMe && n > 0 ? "pointer" : "default" }}
-              >
-                <div
-                  style={{
-                    borderRadius: "50%",
-                    boxShadow: assigningMember === m.id ? `0 0 0 3px ${C.blue}` : "none",
-                  }}
+              <div className="fg-mono" style={{ color: C.textLo, fontSize: 12, marginBottom: 14 }}>
+                Round {Math.floor(me.completedCount / n) + 1} · {me.completedCount % n} of {n} stations this round
+              </div>
+              <div style={{ display: "flex", gap: 10 }}>
+                <button
+                  onClick={() => { onAdvanceMe(); setDoneFlash(true); setTimeout(() => setDoneFlash(false), 1000); }}
+                  className="fg-display"
+                  style={{ flex: 1, background: doneFlash ? "#16A34A" : C.blue, border: "none", borderRadius: 10, padding: "13px", color: "white", fontWeight: 700, fontSize: 14, transition: "background 0.2s" }}
                 >
-                  <MemberAvatar member={m} size={42} />
-                </div>
-                <div style={{ position: "absolute", bottom: -1, right: -1, width: 11, height: 11, borderRadius: "50%", background: m.online ? "#22C55E" : C.textLo, border: `2px solid ${C.bgCard}` }} />
+                  {doneFlash ? "Nice work!" : "Done"}
+                </button>
+                <button onClick={() => setPreviewing(true)} className="fg-display" style={{ flex: 1, background: "#16A34A", border: "none", borderRadius: 10, padding: "13px", color: "white", fontWeight: 700, fontSize: 14 }}>
+                  Start Workout
+                </button>
               </div>
-              <div style={{ flex: 1, minWidth: 0 }}>
-                <div className="fg-display" style={{ color: C.textHi, fontSize: 16, fontWeight: 600 }}>
-                  {m.name} {m.isMe && <span className="fg-mono" style={{ color: C.textLo, fontSize: 10 }}>(you)</span>}
-                </div>
-                <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, marginTop: 2 }}>
-                  {n === 0 ? "No stations yet" : m.online ? `On: ${squadStationName(squadSequence, m.currentIndex)}` : "Resting / offline"} · {m.completedCount} done
-                </div>
-                {n > 0 && (
-                  <div style={{ height: 4, borderRadius: 2, background: C.line, marginTop: 6, overflow: "hidden" }}>
-                    <div style={{ height: "100%", width: `${Math.min(100, ((m.completedCount % n) / n) * 100)}%`, background: `linear-gradient(90deg, ${m.color[0]}, ${m.color[1]})` }} />
-                  </div>
-                )}
-              </div>
-              {m.streak > 0 && (
-                <div className="fg-mono" style={{ color: C.amber, fontSize: 11, display: "flex", alignItems: "center", gap: 3, flexShrink: 0 }}>
-                  <Flame size={12} /> {m.streak}d
-                </div>
-              )}
             </div>
-          ))}
+          ) : null}
         </div>
-      </div>
+      )}
 
-      {/* ===== BUILD TOGETHER (overlay) ===== */}
-      {showBuildTogether && (
-        <div style={{ position: "fixed", inset: 0, background: C.bg, zIndex: 70, display: "flex", flexDirection: "column" }}>
-          <FontImport />
-          <div style={{ padding: "20px 20px 0", display: "flex", alignItems: "center", gap: 12 }}>
-            <button onClick={() => setShowBuildTogether(false)} style={{ background: "none", border: "none" }}>
-              <ArrowLeft size={20} color={C.textLo} />
-            </button>
-            <h2 className="fg-display" style={{ color: C.textHi, fontSize: 22, fontWeight: 700, margin: 0 }}>Build Together</h2>
-          </div>
-          <div className="fg-mono" style={{ color: C.textLo, fontSize: 12, padding: "10px 20px 0", lineHeight: 1.5 }}>
-            The same Library and Builder you use for personal workouts — anything added here is shared with the whole squad.
+      {tab === "Build" && (
+        <div style={{ flex: 1, display: "flex", flexDirection: "column" }}>
+          <div className="fg-mono" style={{ color: C.textLo, fontSize: 12, padding: "14px 20px 0", lineHeight: 1.5 }}>
+            Anything added here appears live for everyone in this session — this is genuinely shared, not just yours.
           </div>
           <div style={{ display: "flex", gap: 8, padding: "12px 20px 0" }}>
             {["Library", "Builder"].map((t) => (
@@ -5966,77 +5915,60 @@ function SquadSessionScreen({
               <LibraryTab
                 onAddToBuild={onAddToBuild}
                 onAddToBurnout={onAddToBurnout}
-                addedIds={new Set(squadSequence.map((b) => b.id))}
-                burnoutIds={new Set(squadBurnout.map((b) => b.id))}
+                addedIds={new Set(buildItems.map((b) => b.id))}
+                burnoutIds={new Set(burnoutItems.map((b) => b.id))}
               />
             )}
 
             {buildSubTab === "Builder" && (
               <BuilderTab
-                buildList={squadSequence}
-                setBuildList={setSquadSequence}
-                burnoutList={squadBurnout}
-                setBurnoutList={setSquadBurnout}
-                config={squadConfig}
-                setConfig={setSquadConfig}
-                onSaveTemplate={onSaveTemplate}
+                buildList={buildItems}
+                setBuildList={setBuildList}
+                burnoutList={burnoutItems}
+                setBurnoutList={setBurnoutList}
+                config={config}
+                setConfig={setConfig}
+                onSaveTemplate={() => {}}
               />
             )}
           </div>
         </div>
       )}
 
-      {/* ===== CHAT (overlay) ===== */}
-      {showChat && (
-        <div style={{ position: "fixed", inset: 0, background: C.bg, zIndex: 70, display: "flex", flexDirection: "column" }}>
-          <FontImport />
-          <div style={{ padding: "20px 20px 0", display: "flex", alignItems: "center", gap: 12 }}>
-            <button onClick={() => setShowChat(false)} style={{ background: "none", border: "none" }}>
-              <ArrowLeft size={20} color={C.textLo} />
-            </button>
-            <h2 className="fg-display" style={{ color: C.textHi, fontSize: 22, fontWeight: 700, margin: 0 }}>Squad Chat</h2>
-          </div>
-          <div ref={chatScrollRef} style={{ flex: 1, overflowY: "auto", padding: "16px 20px" }}>
-            {chat.map((m) => (
-              <div key={m.id} style={{ display: "flex", justifyContent: m.mine ? "flex-end" : "flex-start", marginBottom: 10 }}>
-                <div
-                  style={{
-                    maxWidth: "75%", padding: "10px 13px", borderRadius: 14,
-                    background: m.mine ? C.blue : C.bgCard, border: m.mine ? "none" : `1px solid ${C.line}`,
-                  }}
-                >
-                  {!m.mine && <div className="fg-mono" style={{ color: C.accent, fontSize: 10, marginBottom: 3 }}>{m.from}</div>}
-                  <div className="fg-display" style={{ color: "white", fontSize: 14 }}>{m.text}</div>
-                  <div className="fg-mono" style={{ color: m.mine ? "#DBEAFE" : C.textLo, fontSize: 9, marginTop: 4, textAlign: "right" }}>
-                    {chatRelativeTime(m.at)}
-                  </div>
-                </div>
+      {showInvite && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 70, display: "flex", alignItems: "flex-end" }} onClick={() => setShowInvite(false)}>
+          <div onClick={(e) => e.stopPropagation()} className="fg-sheet-in" style={{ width: "100%", maxHeight: "75vh", overflowY: "auto", background: C.bgRaised, borderTop: `1px solid ${C.line}`, borderRadius: "20px 20px 0 0", padding: 20 }}>
+            <div className="fg-display" style={{ color: C.textHi, fontSize: 20, fontWeight: 700, marginBottom: 16 }}>Invite People</div>
+            {availableFriends.length === 0 ? (
+              <div className="fg-mono" style={{ color: C.textLo, fontSize: 13, textAlign: "center", padding: 20, marginBottom: 10 }}>
+                Everyone in your gym is already in this session, or you haven't added any friends yet.
               </div>
-            ))}
-          </div>
-          <div style={{ padding: "10px 20px", display: "flex", gap: 6, overflowX: "auto" }}>
-            {QUICK_REPLIES.map((q) => (
-              <button
-                key={q}
-                onClick={() => sendChat(q)}
-                className="fg-mono"
-                style={{ flexShrink: 0, padding: "8px 12px", borderRadius: 16, border: `1px solid ${C.line}`, background: C.bgCard, color: C.textHi, fontSize: 12 }}
-              >
-                {q}
-              </button>
-            ))}
-          </div>
-          <div style={{ padding: "10px 20px 20px", display: "flex", gap: 10 }}>
-            <input
-              value={chatText}
-              onChange={(e) => setChatText(e.target.value)}
-              onKeyDown={(e) => { if (e.key === "Enter") sendChat(chatText); }}
-              placeholder="Message the squad..."
-              className="fg-mono"
-              style={{ flex: 1, background: C.bgCard, border: `1px solid ${C.line}`, borderRadius: 20, padding: "12px 16px", color: C.textHi, fontSize: 14 }}
-            />
-            <button onClick={() => sendChat(chatText)} style={{ width: 44, height: 44, borderRadius: "50%", background: C.blue, border: "none", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
-              <Send size={17} color="white" />
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 20 }}>
+                {availableFriends.map((f) => {
+                  const selected = selectedIds.includes(f.id);
+                  return (
+                    <div
+                      key={f.id}
+                      onClick={() => setSelectedIds((ids) => (selected ? ids.filter((id) => id !== f.id) : [...ids, f.id]))}
+                      className="fg-tap"
+                      style={{ display: "flex", alignItems: "center", gap: 10, background: selected ? `${C.blue}22` : C.bgCard, border: `1px solid ${selected ? C.blue : C.line}`, borderRadius: 10, padding: "10px 12px", cursor: "pointer" }}
+                    >
+                      <Avatar name={f.name} url={f.avatarUrl} size={32} />
+                      <div className="fg-display" style={{ flex: 1, color: C.textHi, fontSize: 14, fontWeight: 600 }}>{f.name}</div>
+                      {selected && <Check size={16} color={C.accent} />}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+            <button
+              onClick={() => { onInviteFriends(selectedIds); setSelectedIds([]); setShowInvite(false); }}
+              disabled={selectedIds.length === 0}
+              className="fg-display"
+              style={{ width: "100%", background: C.blue, border: "none", borderRadius: 12, padding: "15px", color: "white", fontWeight: 700, fontSize: 16, opacity: selectedIds.length === 0 ? 0.5 : 1 }}
+            >
+              Send {selectedIds.length > 0 ? `${selectedIds.length} ` : ""}Invite{selectedIds.length !== 1 ? "s" : ""}
             </button>
           </div>
         </div>
@@ -6550,41 +6482,11 @@ export default function App() {
   });
   const [inviteBanner, setInviteBanner] = useState(null); // { name } of whoever's link this is, once known
   const [connectedToast, setConnectedToast] = useState(null);
+  const [activeSquadSession, setActiveSquadSession] = useState(null);
+  const [squadSessionMembers, setSquadSessionMembers] = useState([]);
+  const [pendingSquadInvites, setPendingSquadInvites] = useState([]);
 
   const user = authSession ? { id: authSession.user.id, name: authSession.user.name || authSession.user.email.split("@")[0], email: authSession.user.email, avatarUrl } : null;
-
-  // squad rotation state — lifted to App so it keeps ticking even while
-  // you're inside your own Active Workout screen (see squadInfo below).
-  // Starts genuinely empty for a fresh account — no pre-filled fake
-  // friends or exercises; "You" is the only real member until people
-  // are actually invited in.
-  const [squadSequence, setSquadSequence] = useState([]);
-  const [squadBurnout, setSquadBurnout] = useState([]);
-  const [squadConfig, setSquadConfig] = useState({ mode: "Timer", work: 40, rest: 20, rounds: 1, targetReps: 10, rotationMode: "Exercise-First", circuitTransition: 10 });
-  const [squadMembers, setSquadMembers] = useState([
-    { id: "me", name: "You", isMe: true, color: [C.blue, C.accent], online: true, startIndex: 0, currentIndex: 0, completedCount: 0, streak: 0 },
-  ]);
-
-  // background tick: other squad members quietly progress through their rotation
-  useEffect(() => {
-    const t = setInterval(() => {
-      const n = squadSequence.length;
-      if (n === 0) return;
-      setSquadMembers((ms) =>
-        ms.map((m) =>
-          !m.isMe && m.online && Math.random() < 0.2
-            ? { ...m, currentIndex: (m.currentIndex + 1) % n, completedCount: m.completedCount + 1 }
-            : m
-        )
-      );
-    }, 5000);
-    return () => clearInterval(t);
-  }, [squadSequence.length]);
-
-  // keep the squad roster's "you" entry showing your real photo, once it loads
-  useEffect(() => {
-    setSquadMembers((ms) => ms.map((m) => (m.isMe ? { ...m, avatarUrl } : m)));
-  }, [avatarUrl]);
 
   // On mount: try to restore a real Supabase session (refreshing the token if
   // it's stale). If that succeeds, pull real History + Templates from the cloud.
@@ -6658,6 +6560,11 @@ export default function App() {
     } catch (e) {
       // friends list just stays empty on failure — not worth a banner for this
     }
+    try {
+      setPendingSquadInvites(await fetchPendingInvites(token, userId));
+    } catch (e) {
+      // pending invites just stay empty on failure
+    }
   };
 
   // manual entry — for connecting with someone who already has an account
@@ -6722,6 +6629,9 @@ export default function App() {
     setCustomPrograms([]);
     setFriends([]);
     setMyInviteCode(null);
+    setActiveSquadSession(null);
+    setSquadSessionMembers([]);
+    setPendingSquadInvites([]);
     setView("home");
   };
 
@@ -6747,6 +6657,153 @@ export default function App() {
       setCloudError("Removed locally, but couldn't sync to the server.");
     }
   };
+
+  const startNewSquadSession = async () => {
+    try {
+      const token = await getValidToken(authSession, setAuthSession);
+      if (!token) throw new Error("Not signed in");
+      const newSession = await createSquadSession(token, authSession.user.id, `${user.name}'s Squad`);
+      setActiveSquadSession(newSession);
+      setSquadSessionMembers(await fetchSessionMembers(token, newSession.id));
+      setView("squad");
+    } catch (e) {
+      setCloudError("Couldn't start a squad session — try again.");
+    }
+  };
+
+  const openOrStartSquad = () => {
+    if (activeSquadSession) { setView("squad"); return; }
+    startNewSquadSession();
+  };
+
+  const inviteFriendsToSession = async (friendIds) => {
+    if (!activeSquadSession || !friendIds.length) return;
+    try {
+      const token = await getValidToken(authSession, setAuthSession);
+      if (!token) throw new Error("Not signed in");
+      await inviteToSquadSession(token, activeSquadSession.id, friendIds);
+      setSquadSessionMembers(await fetchSessionMembers(token, activeSquadSession.id));
+    } catch (e) {
+      setCloudError("Couldn't send invites — try again.");
+    }
+  };
+
+  const acceptSquadInvite = async (invitedSession) => {
+    try {
+      const token = await getValidToken(authSession, setAuthSession);
+      if (!token) throw new Error("Not signed in");
+      await joinSquadSession(token, invitedSession.id, authSession.user.id);
+      setPendingSquadInvites((list) => list.filter((i) => i.session.id !== invitedSession.id));
+      setActiveSquadSession(invitedSession);
+      setSquadSessionMembers(await fetchSessionMembers(token, invitedSession.id));
+      setView("squad");
+    } catch (e) {
+      setCloudError("Couldn't join that session — try again.");
+    }
+  };
+
+  const declineSquadInvite = async (invitedSession) => {
+    setPendingSquadInvites((list) => list.filter((i) => i.session.id !== invitedSession.id)); // optimistic
+    try {
+      const token = await getValidToken(authSession, setAuthSession);
+      if (!token) throw new Error("Not signed in");
+      await leaveSquadSession(token, invitedSession.id, authSession.user.id);
+    } catch (e) {
+      setCloudError("Couldn't decline — try again.");
+    }
+  };
+
+  const leaveCurrentSquadSession = async () => {
+    const leaving = activeSquadSession;
+    setActiveSquadSession(null);
+    setSquadSessionMembers([]);
+    setView("home");
+    if (!leaving) return;
+    try {
+      const token = await getValidToken(authSession, setAuthSession);
+      if (!token) throw new Error("Not signed in");
+      await leaveSquadSession(token, leaving.id, authSession.user.id);
+    } catch (e) {
+      setCloudError("Left locally, but couldn't sync to the server.");
+    }
+  };
+
+  const updateSharedSquadBuild = async (patch) => {
+    if (!activeSquadSession) return;
+    setActiveSquadSession((s) => (s ? { ...s, ...patch } : s)); // optimistic
+    try {
+      const token = await getValidToken(authSession, setAuthSession);
+      if (!token) throw new Error("Not signed in");
+      await updateSharedBuild(token, activeSquadSession.id, patch);
+    } catch (e) {
+      setCloudError("Updated locally, but couldn't sync to the server.");
+    }
+  };
+
+  const advanceMySquadProgress = async () => {
+    if (!activeSquadSession || !user) return;
+    const me = squadSessionMembers.find((m) => m.id === user.id);
+    if (!me) return;
+    const n = Math.max(1, activeSquadSession.buildItems.length);
+    const newIndex = (me.currentIndex + 1) % n;
+    const newCount = me.completedCount + 1;
+    setSquadSessionMembers((list) => list.map((m) => (m.id === user.id ? { ...m, currentIndex: newIndex, completedCount: newCount } : m))); // optimistic
+    try {
+      const token = await getValidToken(authSession, setAuthSession);
+      if (!token) throw new Error("Not signed in");
+      await updateMemberProgress(token, activeSquadSession.id, user.id, { currentIndex: newIndex, completedCount: newCount });
+    } catch (e) {
+      setCloudError("Updated locally, but couldn't sync to the server.");
+    }
+  };
+
+  // add/remove-toggle helpers for the shared Library tab, and raw setters
+  // for the shared Builder tab's reordering/superset/config operations —
+  // both funnel through updateSharedSquadBuild so every change syncs live
+  const addToSharedSquadBuild = (ex) => {
+    const list = activeSquadSession?.buildItems || [];
+    const idx = list.findIndex((b) => b.id === ex.id);
+    const newList = idx >= 0 ? normalizeSupersetGroups(list.filter((_, i) => i !== idx)) : [...list, { ...ex, uid: nextUid(), modeOverride: "Session Default" }];
+    updateSharedSquadBuild({ buildItems: newList });
+  };
+  const addToSharedSquadBurnout = (ex) => {
+    const list = activeSquadSession?.burnoutItems || [];
+    const idx = list.findIndex((b) => b.id === ex.id);
+    const newList = idx >= 0 ? list.filter((_, i) => i !== idx) : [...list, { ...ex, uid: nextUid() }];
+    updateSharedSquadBuild({ burnoutItems: newList });
+  };
+  const setSharedSquadBuildList = (newList) => updateSharedSquadBuild({ buildItems: newList });
+  const setSharedSquadBurnoutList = (newList) => updateSharedSquadBuild({ burnoutItems: newList });
+  const updateSharedSquadConfig = (newConfig) => updateSharedSquadBuild({ config: newConfig });
+
+  const startRealSquadWorkout = ({ buildList, burnoutList, config }) => {
+    setPendingTemplate({ buildList, burnoutList, config });
+    setView("builder");
+  };
+
+  // Live sync for whichever real squad session is currently open — the
+  // one thing in this whole app that genuinely can't work with plain fetch.
+  useEffect(() => {
+    if (!activeSquadSession?.id || !authSession) return;
+    let cancelled = false;
+    let cleanupFn = null;
+    (async () => {
+      const token = await getValidToken(authSession, setAuthSession);
+      if (!token || cancelled) return;
+      cleanupFn = subscribeToSquadSession(
+        token,
+        activeSquadSession.id,
+        (updatedSession) => setActiveSquadSession((s) => (s ? { ...s, ...updatedSession } : s)),
+        async () => {
+          try {
+            setSquadSessionMembers(await fetchSessionMembers(token, activeSquadSession.id));
+          } catch (e) {}
+        }
+      );
+    })();
+    return () => { cancelled = true; if (cleanupFn) cleanupFn(); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeSquadSession?.id]);
 
   const finishOnboarding = () => {
     setNeedsOnboarding(false);
@@ -6879,59 +6936,6 @@ export default function App() {
     setView("builder");
   };
 
-  const squadAddToBuild = (ex) =>
-    setSquadSequence((l) => {
-      const idx = l.findIndex((b) => b.id === ex.id);
-      if (idx >= 0) return normalizeSupersetGroups(l.filter((_, i) => i !== idx));
-      return [...l, { ...ex, uid: nextUid(), modeOverride: "Session Default", addedBy: "You" }];
-    });
-  const squadAddToBurnout = (ex) =>
-    setSquadBurnout((l) => {
-      const idx = l.findIndex((b) => b.id === ex.id);
-      if (idx >= 0) return l.filter((_, i) => i !== idx);
-      return [...l, { ...ex, uid: nextUid(), addedBy: "You" }];
-    });
-
-  const squadAutoAssignStarts = () => {
-    const n = squadSequence.length;
-    if (n === 0) return;
-    setSquadMembers((ms) =>
-      ms.map((m, i) => {
-        const start = Math.floor((i * n) / ms.length);
-        return { ...m, startIndex: start, currentIndex: start, completedCount: 0 };
-      })
-    );
-  };
-
-  const squadAssignStart = (memberId, stationIndex) =>
-    setSquadMembers((ms) => ms.map((m) => (m.id === memberId ? { ...m, startIndex: stationIndex, currentIndex: stationIndex, completedCount: 0 } : m)));
-
-  const squadAdvanceMe = () => {
-    const n = squadSequence.length;
-    if (n === 0) return;
-    setSquadMembers((ms) => ms.map((m) => (m.isMe ? { ...m, currentIndex: (m.currentIndex + 1) % n, completedCount: m.completedCount + 1 } : m)));
-  };
-
-  const squadResetRotation = () => {
-    setSquadMembers((ms) => ms.map((m) => ({ ...m, currentIndex: m.startIndex, completedCount: 0 })));
-  };
-
-  const startSquadWorkout = () => {
-    const n = squadSequence.length;
-    if (n === 0) return;
-    const me = squadMembers.find((m) => m.isMe);
-    const startAt = me ? me.currentIndex : 0;
-    const rotated = [...squadSequence.slice(startAt), ...squadSequence.slice(0, startAt)].map((item) => ({ ...item, uid: nextUid() }));
-    const burnout = squadBurnout.map((item) => ({ ...item, uid: nextUid() }));
-    setSession({
-      buildList: rotated,
-      burnoutList: burnout,
-      config: squadConfig,
-      squadInfo: { sequence: squadSequence, members: squadMembers },
-    });
-    setView("active");
-  };
-
   if (!hydrated) return <AppLoadingScreen />;
 
   if (!user) return <AuthScreen onAuthed={handleAuthed} hasPendingInvite={!!pendingInviteCode} />;
@@ -6941,24 +6945,32 @@ export default function App() {
   let screen;
 
   if (view === "squad") {
-    screen = (
+    screen = !activeSquadSession ? (
+      <div style={{ minHeight: "100vh", background: C.bg, display: "flex", alignItems: "center", justifyContent: "center", padding: 24 }}>
+        <FontImport />
+        <div style={{ textAlign: "center" }}>
+          <div className="fg-display" style={{ color: C.textHi, fontSize: 20, fontWeight: 700, marginBottom: 12 }}>No active session</div>
+          <button onClick={() => setView("social")} className="fg-display" style={{ background: C.blue, border: "none", borderRadius: 10, padding: "12px 24px", color: "white" }}>
+            Back to Social
+          </button>
+        </div>
+      </div>
+    ) : (
       <SquadSessionScreen
+        session={activeSquadSession}
+        members={squadSessionMembers}
+        myId={user.id}
+        friends={friends}
+        onAddToBuild={addToSharedSquadBuild}
+        onAddToBurnout={addToSharedSquadBurnout}
+        onSetBuildList={setSharedSquadBuildList}
+        onSetBurnoutList={setSharedSquadBurnoutList}
+        onUpdateConfig={updateSharedSquadConfig}
+        onInviteFriends={inviteFriendsToSession}
+        onStartWorkout={startRealSquadWorkout}
+        onAdvanceMe={advanceMySquadProgress}
+        onLeaveSession={leaveCurrentSquadSession}
         onBack={() => setView("social")}
-        squadSequence={squadSequence}
-        squadBurnout={squadBurnout}
-        setSquadBurnout={setSquadBurnout}
-        setSquadSequence={setSquadSequence}
-        squadConfig={squadConfig}
-        setSquadConfig={setSquadConfig}
-        squadMembers={squadMembers}
-        onAddToBuild={squadAddToBuild}
-        onAddToBurnout={squadAddToBurnout}
-        onAutoAssignStarts={squadAutoAssignStarts}
-        onAssignStart={squadAssignStart}
-        onAdvanceMe={squadAdvanceMe}
-        onResetRotation={squadResetRotation}
-        onStartSquadWorkout={startSquadWorkout}
-        onSaveTemplate={saveTemplate}
       />
     );
   } else if (view === "programs") {
@@ -6983,12 +6995,15 @@ export default function App() {
         history={history}
         friends={friends}
         myInviteCode={myInviteCode}
+        pendingSquadInvites={pendingSquadInvites}
         onBack={() => setView("home")}
         onSignOut={signOut}
-        onStartSquad={() => setView("squad")}
+        onStartSquad={openOrStartSquad}
         onChangeAvatar={changeAvatar}
         onRemoveFriend={removeFriend}
         onConnectByCode={connectByCode}
+        onAcceptSquadInvite={acceptSquadInvite}
+        onDeclineSquadInvite={declineSquadInvite}
       />
     );
   } else if (view === "history") {
@@ -7033,7 +7048,7 @@ export default function App() {
         user={user}
         history={history}
         templates={templates}
-        squadMembers={squadMembers}
+        friends={friends}
         activeProgramRow={activeProgramRow}
         allPrograms={allPrograms}
         onStartBuild={startBuilderEmpty}
