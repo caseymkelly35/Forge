@@ -6515,14 +6515,21 @@ export default function App() {
             setAvatarUrl(profileExtras.avatar_url || null);
             setActiveProgramRow(program);
             setCustomPrograms(customProgs);
-            await finishSocialSetup(token, stored.user.id, profileExtras.invite_code);
+
+            try {
+              await finishSocialSetup(token, stored.user.id, profileExtras.invite_code);
+            } catch (e) {
+              // a hiccup here (friends/invites) should never block the app from loading
+            }
 
             // rejoin whichever squad session you were in before a refresh —
             // previously a refresh silently dropped you back to Home with
-            // no way back in, which looked identical to "sync is broken"
-            const storedSessionId = await storageGet("active-squad-session-id");
-            if (storedSessionId) {
-              try {
+            // no way back in, which looked identical to "sync is broken".
+            // This is deliberately its own independent try/catch, outside
+            // anything above, so nothing upstream can ever silently skip it.
+            try {
+              const storedSessionId = await storageGet("active-squad-session-id");
+              if (storedSessionId) {
                 const restoredSession = await fetchSquadSession(token, storedSessionId);
                 if (restoredSession) {
                   setActiveSquadSession(restoredSession);
@@ -6531,9 +6538,9 @@ export default function App() {
                 } else {
                   storageSet("active-squad-session-id", null);
                 }
-              } catch (e) {
-                // session no longer accessible — just stay on Home
               }
+            } catch (e) {
+              // session no longer accessible, or a network hiccup — just stay on Home
             }
           } catch (e) {
             setCloudError("Couldn't reach the server — showing what's cached locally.");
