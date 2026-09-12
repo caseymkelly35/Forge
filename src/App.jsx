@@ -116,11 +116,6 @@ async function supabaseRest(path, { method = "GET", token, body, extraHeaders = 
   return text ? JSON.parse(text) : null;
 }
 
-async function fetchHasOnboarded(token, userId) {
-  const rows = await supabaseRest(`profiles?id=eq.${userId}&select=has_onboarded`, { token });
-  return rows?.[0]?.has_onboarded ?? false;
-}
-
 async function markOnboarded(token, userId) {
   await supabaseRest(`profiles?id=eq.${userId}`, { method: "PATCH", token, body: { has_onboarded: true } });
 }
@@ -3203,7 +3198,7 @@ function ActiveWorkoutScreen({ buildList, burnoutList, config, squadInfo, onExit
   // and briefly floats them on screen — like a live-stream comment feed —
   // without requiring you to open the Squad panel just to notice them.
   useEffect(() => {
-    if (!squadMessages) return;
+    if (!squadMessages || !squadInfo) return;
     if (seenMessageIdsRef.current === null) {
       // first sight of the message list — mark everything already here as
       // "seen" so we don't float a burst of old history on mount
@@ -4583,7 +4578,7 @@ function useHistoryData(liveHistory) {
   return useMemo(() => {
     const sessions = [...liveHistory].sort((a, b) => b.date - a.date);
     const allSets = [];
-    sessions.forEach((s) => s.sets.forEach((set) => allSets.push({ ...set, sessionId: s.id, sessionDate: s.date, sessionMode: s.mode })));
+    sessions.forEach((s) => (s.sets || []).forEach((set) => allSets.push({ ...set, sessionId: s.id, sessionDate: s.date, sessionMode: s.mode })));
 
     const totalSessions = sessions.length;
     const totalSets = allSets.length;
@@ -6552,7 +6547,7 @@ function ProgramEditorScreen({ program, templates, onCancel, onSave }) {
         <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 20 }}>
           {dayOrder.map((dayNum) => {
             const d = days.find((x) => x.day === dayNum);
-            const isRest = d.type === "rest";
+            const isRest = !d || d.type === "rest";
             return (
               <div key={dayNum} style={{ background: C.bgCard, border: `1px solid ${isRest ? C.line : "#8B5CF666"}`, borderRadius: 12, padding: "12px 14px" }}>
                 <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: isRest ? 0 : 10 }}>
@@ -7046,7 +7041,10 @@ export default function App() {
   // you, not just accurate at the moment you logged in
   useEffect(() => {
     if (!authSession) return;
-    const tick = () => updateLastSeen(authSession.access_token, authSession.user.id).catch(() => {});
+    const tick = async () => {
+      const token = await getValidToken(authSession, setAuthSession);
+      if (token) updateLastSeen(token, authSession.user.id).catch(() => {});
+    };
     const t = setInterval(tick, 2 * 60 * 1000);
     return () => clearInterval(t);
   }, [authSession]);
@@ -7399,9 +7397,11 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeSquadSession?.id]);
 
-  const finishOnboarding = () => {
+  const finishOnboarding = async () => {
     setNeedsOnboarding(false);
-    if (authSession) markOnboarded(authSession.access_token, authSession.user.id).catch(() => {});
+    if (!authSession) return;
+    const token = await getValidToken(authSession, setAuthSession);
+    if (token) markOnboarded(token, authSession.user.id).catch(() => {});
   };
 
   const saveSession = async (record) => {
