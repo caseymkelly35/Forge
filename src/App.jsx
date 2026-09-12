@@ -3525,7 +3525,7 @@ function ActiveWorkoutScreen({ buildList, burnoutList, config, squadInfo, onExit
             </div>
 
             {(() => {
-              const leaderboard = [...squadInfo.members].map((m) => ({ ...m, points: m.completedCount * 10 + m.streak * 5 })).sort((a, b) => b.points - a.points);
+              const leaderboard = [...squadInfo.members].map((m) => ({ ...m, points: m.completedCount * 10 + (m.streak || 0) * 5 })).sort((a, b) => b.points - a.points);
               return leaderboard.some((m) => m.points > 0) ? (
                 <div style={{ display: "flex", gap: 8, marginBottom: 18, overflowX: "auto" }}>
                   {leaderboard.slice(0, 3).map((m, i) => (
@@ -5171,11 +5171,12 @@ function MemberAvatar({ member, size = 40 }) {
       />
     );
   }
+  const [c1, c2] = member.color || avatarColorFor(member.name);
   return (
     <div
       style={{
         width: size, height: size, borderRadius: "50%",
-        background: `linear-gradient(135deg, ${member.color[0]}, ${member.color[1]})`,
+        background: `linear-gradient(135deg, ${c1}, ${c2})`,
         display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0,
       }}
     >
@@ -6564,6 +6565,7 @@ export default function App() {
   const [history, setHistory] = useState([]);
   const [templates, setTemplates] = useState(PRESET_TEMPLATES);
   const [pendingTemplate, setPendingTemplate] = useState(null);
+  const [workoutFromSquad, setWorkoutFromSquad] = useState(false);
   const [hydrated, setHydrated] = useState(false);
   const [cloudError, setCloudError] = useState("");
   const [needsOnboarding, setNeedsOnboarding] = useState(false);
@@ -6941,6 +6943,7 @@ export default function App() {
 
   const startRealSquadWorkout = ({ buildList, burnoutList, config }) => {
     setPendingTemplate({ buildList, burnoutList, config });
+    setWorkoutFromSquad(true);
     setView("builder");
   };
 
@@ -7056,6 +7059,7 @@ export default function App() {
 
   const loadTemplate = (tpl) => {
     setPendingTemplate(instantiateTemplate(tpl));
+    setWorkoutFromSquad(false);
     setView("builder");
   };
 
@@ -7085,6 +7089,7 @@ export default function App() {
 
   const startTodayWorkout = (dayDef) => {
     setPendingTemplate(instantiateTemplate({ config: dayDef.config, buildItems: dayDef.buildItems, burnoutItems: dayDef.burnoutItems || [] }));
+    setWorkoutFromSquad(false);
     setView("builder");
   };
 
@@ -7120,6 +7125,7 @@ export default function App() {
 
   const startBuilderEmpty = () => {
     setPendingTemplate(null);
+    setWorkoutFromSquad(false);
     setView("builder");
   };
 
@@ -7215,7 +7221,7 @@ export default function App() {
         buildList={session.buildList}
         burnoutList={session.burnoutList}
         config={session.config}
-        squadInfo={session.squadInfo}
+        squadInfo={workoutFromSquad && activeSquadSession ? { sequence: activeSquadSession.buildItems || [], members: squadSessionMembers.filter((m) => m.status === "joined") } : null}
         onExit={() => setView("home")}
         onSaveSession={saveSession}
       />
