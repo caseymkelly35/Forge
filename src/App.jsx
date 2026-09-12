@@ -3163,7 +3163,7 @@ function WorkoutPreviewScreen({ buildList, burnoutList, config, onBack, onConfir
 /* ============================================================
    ACTIVE WORKOUT SCREEN
    ============================================================ */
-function ActiveWorkoutScreen({ buildList, burnoutList, config, squadInfo, onExit, onSaveSession }) {
+function ActiveWorkoutScreen({ buildList, burnoutList, config, squadInfo, onExit, onSaveSession, onSquadProgress }) {
   const timeline = useMemo(() => buildTimeline(buildList, burnoutList, config), [buildList, burnoutList, config]);
   const [idx, setIdx] = useState(0);
   const [remaining, setRemaining] = useState(timeline[0]?.duration ?? null);
@@ -3177,6 +3177,21 @@ function ActiveWorkoutScreen({ buildList, burnoutList, config, squadInfo, onExit
   const [squadPingSent, setSquadPingSent] = useState(null);
 
   const phase = timeline[idx];
+
+  // As your OWN workout timer naturally moves through exercises, quietly
+  // report your real position back to the shared session — this is what
+  // makes your squad-mates' live view actually track you, instead of
+  // freezing at whatever station the countdown originally assigned.
+  const lastReportedStationRef = useRef(null);
+  useEffect(() => {
+    if (!squadInfo || !onSquadProgress || !phase || phase.stage !== "main" || phase.kind !== "work") return;
+    const currentUid = phase.exercise?.uid || phase.exercises?.[0]?.uid;
+    if (!currentUid) return;
+    const stationIdx = squadInfo.sequence.findIndex((s) => s.uid === currentUid);
+    if (stationIdx === -1 || stationIdx === lastReportedStationRef.current) return;
+    lastReportedStationRef.current = stationIdx;
+    onSquadProgress(stationIdx);
+  }, [phase, squadInfo, onSquadProgress]);
 
   const advance = () => {
     const next = idx + 1;
@@ -7022,6 +7037,22 @@ export default function App() {
     }
   };
 
+  // Called automatically as your own workout timer naturally moves through
+  // exercises — a quiet background sync, so failures here shouldn't
+  // interrupt an active workout with an error banner the way user-initiated
+  // actions do.
+  const reportSquadProgress = async (stationIndex) => {
+    if (!activeSquadSession || !user) return;
+    setSquadSessionMembers((list) => list.map((m) => (m.id === user.id ? { ...m, currentIndex: stationIndex } : m))); // optimistic
+    try {
+      const token = await getValidToken(authSession, setAuthSession);
+      if (!token) return;
+      await updateMemberProgress(token, activeSquadSession.id, user.id, { currentIndex: stationIndex });
+    } catch (e) {
+      // silent — the next natural exercise change, or the polling backup, will catch up
+    }
+  };
+
   const toggleMyReady = async () => {
     if (!activeSquadSession || !user) return;
     const me = squadSessionMembers.find((m) => m.id === user.id);
@@ -7396,6 +7427,7 @@ export default function App() {
         squadInfo={workoutFromSquad && activeSquadSession ? { sequence: activeSquadSession.buildItems || [], members: squadSessionMembers.filter((m) => m.status === "joined") } : null}
         onExit={() => setView("home")}
         onSaveSession={saveSession}
+        onSquadProgress={reportSquadProgress}
       />
     );
   } else if (view === "builder") {
