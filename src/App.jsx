@@ -3180,7 +3180,7 @@ function WorkoutPreviewScreen({ buildList, burnoutList, config, onBack, onConfir
 /* ============================================================
    ACTIVE WORKOUT SCREEN
    ============================================================ */
-function ActiveWorkoutScreen({ buildList, burnoutList, config, squadInfo, onExit, onSaveSession, onSquadProgress, onSendPing }) {
+function ActiveWorkoutScreen({ buildList, burnoutList, config, squadInfo, onExit, onSaveSession, onSquadProgress, onSendPing, squadMessages }) {
   const timeline = useMemo(() => buildTimeline(buildList, burnoutList, config), [buildList, burnoutList, config]);
   const [idx, setIdx] = useState(0);
   const [remaining, setRemaining] = useState(timeline[0]?.duration ?? null);
@@ -3192,6 +3192,7 @@ function ActiveWorkoutScreen({ buildList, burnoutList, config, squadInfo, onExit
   const [elapsed, setElapsed] = useState(0);
   const [showSquadExpand, setShowSquadExpand] = useState(false);
   const [squadPingSent, setSquadPingSent] = useState(null);
+  const [panelChatText, setPanelChatText] = useState("");
 
   const phase = timeline[idx];
 
@@ -3614,6 +3615,43 @@ function ActiveWorkoutScreen({ buildList, burnoutList, config, squadInfo, onExit
                   </div>
                 );
               })}
+            </div>
+
+            <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: 10 }}>
+              Squad Chat
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 14, maxHeight: 160, overflowY: "auto" }}>
+              {!squadMessages || squadMessages.length === 0 ? (
+                <div className="fg-mono" style={{ color: C.textLo, fontSize: 12, textAlign: "center", padding: "10px 0" }}>
+                  No messages yet.
+                </div>
+              ) : (
+                squadMessages.slice(-5).map((m) => {
+                  const sender = squadInfo.members.find((mem) => mem.id === m.userId);
+                  return (
+                    <div key={m.id} className="fg-mono" style={{ fontSize: 12, color: C.textHi }}>
+                      <span style={{ color: C.accent }}>{sender?.name || "Member"}: </span>
+                      {m.text}
+                    </div>
+                  );
+                })
+              )}
+            </div>
+            <div style={{ display: "flex", gap: 8, marginBottom: 20 }}>
+              <input
+                value={panelChatText}
+                onChange={(e) => setPanelChatText(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter" && panelChatText.trim()) { onSendPing?.(panelChatText); setPanelChatText(""); } }}
+                placeholder="Message the squad..."
+                className="fg-mono"
+                style={{ flex: 1, background: C.bg, border: `1px solid ${C.line}`, borderRadius: 20, padding: "10px 14px", color: C.textHi, fontSize: 13, outline: "none" }}
+              />
+              <button
+                onClick={() => { if (panelChatText.trim()) { onSendPing?.(panelChatText); setPanelChatText(""); } }}
+                style={{ width: 38, height: 38, borderRadius: "50%", background: C.blue, border: "none", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}
+              >
+                <Send size={15} color="white" />
+              </button>
             </div>
 
             <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: 10, textAlign: "center" }}>
@@ -7542,6 +7580,7 @@ export default function App() {
         onSaveSession={saveSession}
         onSquadProgress={reportSquadProgress}
         onSendPing={sendChatMessage}
+        squadMessages={squadMessages}
       />
     );
   } else if (view === "builder") {
