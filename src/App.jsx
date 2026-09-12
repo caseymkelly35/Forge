@@ -7112,9 +7112,9 @@ export default function App() {
 
 
   const startRealSquadWorkout = ({ buildList, burnoutList, config }) => {
-    setPendingTemplate({ buildList, burnoutList, config });
+    setSession({ buildList, burnoutList, config });
     setWorkoutFromSquad(true);
-    setView("builder");
+    setView("active");
   };
 
   // Live sync for whichever real squad session is currently open — the
