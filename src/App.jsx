@@ -302,7 +302,21 @@ async function startSquadRound(token, sessionId, assignments) {
 
 // Live sync — the one thing plain fetch can't do. Call the returned
 // unsubscribe function when leaving the session screen.
-function subscribeToSquadSession(token, sessionId, onSessionChange, onMembersChange) {
+function dbMessageToLocal(row) {
+  return { id: row.id, sessionId: row.session_id, userId: row.user_id, text: row.text, createdAt: row.created_at };
+}
+
+async function fetchSquadMessages(token, sessionId) {
+  const rows = await supabaseRest(`squad_messages?session_id=eq.${sessionId}&select=*&order=created_at.asc&limit=200`, { token });
+  return (rows || []).map(dbMessageToLocal);
+}
+
+async function sendSquadMessage(token, sessionId, userId, text) {
+  const [row] = await supabaseRest("squad_messages", { method: "POST", token, body: { session_id: sessionId, user_id: userId, text } });
+  return dbMessageToLocal(row);
+}
+
+function subscribeToSquadSession(token, sessionId, onSessionChange, onMembersChange, onNewMessage) {
   supabaseRealtime.realtime.setAuth(token);
   const channel = supabaseRealtime
     .channel(`squad-session-${sessionId}`)
@@ -311,6 +325,9 @@ function subscribeToSquadSession(token, sessionId, onSessionChange, onMembersCha
     })
     .on("postgres_changes", { event: "*", schema: "public", table: "squad_session_members", filter: `session_id=eq.${sessionId}` }, () => {
       onMembersChange();
+    })
+    .on("postgres_changes", { event: "INSERT", schema: "public", table: "squad_messages", filter: `session_id=eq.${sessionId}` }, (payload) => {
+      if (payload.new && onNewMessage) onNewMessage(dbMessageToLocal(payload.new));
     })
     .subscribe();
   return () => supabaseRealtime.removeChannel(channel);
@@ -3163,7 +3180,7 @@ function WorkoutPreviewScreen({ buildList, burnoutList, config, onBack, onConfir
 /* ============================================================
    ACTIVE WORKOUT SCREEN
    ============================================================ */
-function ActiveWorkoutScreen({ buildList, burnoutList, config, squadInfo, onExit, onSaveSession, onSquadProgress }) {
+function ActiveWorkoutScreen({ buildList, burnoutList, config, squadInfo, onExit, onSaveSession, onSquadProgress, onSendPing }) {
   const timeline = useMemo(() => buildTimeline(buildList, burnoutList, config), [buildList, burnoutList, config]);
   const [idx, setIdx] = useState(0);
   const [remaining, setRemaining] = useState(timeline[0]?.duration ?? null);
@@ -3606,7 +3623,7 @@ function ActiveWorkoutScreen({ buildList, burnoutList, config, squadInfo, onExit
               {["💪", "🔥", "👊", "⚡"].map((emoji) => (
                 <button
                   key={emoji}
-                  onClick={() => { setSquadPingSent(emoji); setTimeout(() => setSquadPingSent(null), 1400); }}
+                  onClick={() => { onSendPing?.(emoji); setSquadPingSent(emoji); setTimeout(() => setSquadPingSent(null), 1400); }}
                   style={{
                     width: 50, height: 50, borderRadius: "50%",
                     background: squadPingSent === emoji ? `${C.blue}33` : C.bgCard,
@@ -5809,10 +5826,10 @@ function SquadAudioBar({ bpm, onBpmChange, playing, onTogglePlay }) {
 }
 
 function SquadSessionScreen({
-  session, members, myId, friends, templates,
+  session, members, myId, friends, templates, messages,
   onAddToBuild, onAddToBurnout, onSetBuildList, onSetBurnoutList, onUpdateConfig,
   onInviteFriends, onStartWorkout, onAdvanceMe, onLeaveSession, onBack, onApplyTemplate,
-  onToggleReady, onPickStation,
+  onToggleReady, onPickStation, onSendMessage,
 }) {
   const [tab, setTab] = useState(() => ((session.buildItems || []).length === 0 ? "Build" : "Roster"));
   const [buildSubTab, setBuildSubTab] = useState("Library");
@@ -5826,7 +5843,14 @@ function SquadSessionScreen({
   const [showStarting, setShowStarting] = useState(false);
   const [countdown, setCountdown] = useState(10);
   const [pickingStation, setPickingStation] = useState(false);
+  const [chatText, setChatText] = useState("");
+  const [lastSeenChatCount, setLastSeenChatCount] = useState(messages.length);
+  const chatScrollRef = useRef(null);
   const seenRoundStartRef = useRef(session.roundStartedAt);
+
+  useEffect(() => {
+    if (chatScrollRef.current) chatScrollRef.current.scrollTo({ top: chatScrollRef.current.scrollHeight, behavior: "smooth" });
+  }, [messages, tab]);
 
   const buildItems = session.buildItems || [];
   const burnoutItems = session.burnoutItems || [];
@@ -5960,6 +5984,16 @@ function SquadSessionScreen({
           style={{ flex: 1, padding: "11px 0", borderRadius: 10, border: `1px solid ${tab === "Build" ? C.blue : C.line}`, background: tab === "Build" ? `${C.blue}1A` : "transparent", color: tab === "Build" ? C.accent : C.textLo, fontWeight: 600, fontSize: 14 }}
         >
           Build Together
+        </button>
+        <button
+          onClick={() => { setTab("Chat"); setLastSeenChatCount(messages.length); }}
+          className="fg-display"
+          style={{ flex: 1, padding: "11px 0", borderRadius: 10, border: `1px solid ${tab === "Chat" ? C.blue : C.line}`, background: tab === "Chat" ? `${C.blue}1A` : "transparent", color: tab === "Chat" ? C.accent : C.textLo, fontWeight: 600, fontSize: 14, position: "relative" }}
+        >
+          Chat
+          {messages.length > lastSeenChatCount && (
+            <span style={{ position: "absolute", top: 6, right: "30%", width: 8, height: 8, borderRadius: "50%", background: C.amber }} />
+          )}
         </button>
       </div>
 
@@ -6123,6 +6157,52 @@ function SquadSessionScreen({
                 onSaveTemplate={() => {}}
               />
             )}
+          </div>
+        </div>
+      )}
+
+      {tab === "Chat" && (
+        <div style={{ flex: 1, display: "flex", flexDirection: "column" }}>
+          <div ref={chatScrollRef} style={{ flex: 1, overflowY: "auto", padding: "16px 20px" }}>
+            {messages.length === 0 ? (
+              <div className="fg-mono" style={{ color: C.textLo, fontSize: 13, textAlign: "center", padding: 30 }}>
+                No messages yet — say hi to your squad.
+              </div>
+            ) : (
+              messages.map((m) => {
+                const sender = members.find((mem) => mem.id === m.userId);
+                const isMine = m.userId === myId;
+                return (
+                  <div key={m.id} style={{ display: "flex", justifyContent: isMine ? "flex-end" : "flex-start", marginBottom: 10 }}>
+                    <div
+                      style={{
+                        maxWidth: "75%", padding: "10px 13px", borderRadius: 14,
+                        background: isMine ? C.blue : C.bgCard, border: isMine ? "none" : `1px solid ${C.line}`,
+                      }}
+                    >
+                      {!isMine && <div className="fg-mono" style={{ color: C.accent, fontSize: 10, marginBottom: 3 }}>{sender?.name || "Member"}</div>}
+                      <div className="fg-display" style={{ color: "white", fontSize: 14 }}>{m.text}</div>
+                    </div>
+                  </div>
+                );
+              })
+            )}
+          </div>
+          <div style={{ padding: "10px 20px 20px", display: "flex", gap: 10 }}>
+            <input
+              value={chatText}
+              onChange={(e) => setChatText(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter" && chatText.trim()) { onSendMessage(chatText); setChatText(""); } }}
+              placeholder="Message the squad..."
+              className="fg-mono"
+              style={{ flex: 1, background: C.bgCard, border: `1px solid ${C.line}`, borderRadius: 20, padding: "12px 16px", color: C.textHi, fontSize: 14, outline: "none" }}
+            />
+            <button
+              onClick={() => { if (chatText.trim()) { onSendMessage(chatText); setChatText(""); } }}
+              style={{ width: 44, height: 44, borderRadius: "50%", background: C.blue, border: "none", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}
+            >
+              <Send size={17} color="white" />
+            </button>
           </div>
         </div>
       )}
@@ -6704,6 +6784,7 @@ export default function App() {
   const [connectedToast, setConnectedToast] = useState(null);
   const [activeSquadSession, setActiveSquadSession] = useState(null);
   const [squadSessionMembers, setSquadSessionMembers] = useState([]);
+  const [squadMessages, setSquadMessages] = useState([]);
   const [pendingSquadInvites, setPendingSquadInvites] = useState([]);
 
   // Skips its very first firing (which happens on every mount, before the
@@ -6762,6 +6843,7 @@ export default function App() {
                 if (restoredSession) {
                   setActiveSquadSession(restoredSession);
                   setSquadSessionMembers(await fetchSessionMembers(token, storedSessionId));
+                  setSquadMessages(await fetchSquadMessages(token, storedSessionId));
                   setView("squad");
                 } else {
                   storageSet("active-squad-session-id", null);
@@ -6889,6 +6971,7 @@ export default function App() {
     setMyInviteCode(null);
     setActiveSquadSession(null);
     setSquadSessionMembers([]);
+    setSquadMessages([]);
     setPendingSquadInvites([]);
     setView("home");
   };
@@ -6923,6 +7006,7 @@ export default function App() {
       const newSession = await createSquadSession(token, authSession.user.id, `${user.name}'s Squad`);
       setActiveSquadSession(newSession);
       setSquadSessionMembers(await fetchSessionMembers(token, newSession.id));
+      setSquadMessages([]);
       setView("squad");
     } catch (e) {
       setCloudError("Couldn't start a squad session — try again.");
@@ -6976,6 +7060,7 @@ export default function App() {
       setPendingSquadInvites((list) => list.filter((i) => i.session.id !== invitedSession.id));
       setActiveSquadSession(invitedSession);
       setSquadSessionMembers(await fetchSessionMembers(token, invitedSession.id));
+      setSquadMessages(await fetchSquadMessages(token, invitedSession.id));
       setView("squad");
     } catch (e) {
       setCloudError("Couldn't join that session — try again.");
@@ -6997,6 +7082,7 @@ export default function App() {
     const leaving = activeSquadSession;
     setActiveSquadSession(null);
     setSquadSessionMembers([]);
+    setSquadMessages([]);
     setView("home");
     if (!leaving) return;
     try {
@@ -7005,6 +7091,22 @@ export default function App() {
       await leaveSquadSession(token, leaving.id, authSession.user.id);
     } catch (e) {
       setCloudError("Left locally, but couldn't sync to the server.");
+    }
+  };
+
+  const sendChatMessage = async (text) => {
+    const trimmed = text.trim();
+    if (!activeSquadSession || !user || !trimmed) return;
+    const tempId = `temp_${Date.now()}`;
+    setSquadMessages((list) => [...list, { id: tempId, sessionId: activeSquadSession.id, userId: user.id, text: trimmed, createdAt: new Date().toISOString() }]);
+    try {
+      const token = await getValidToken(authSession, setAuthSession);
+      if (!token) throw new Error("Not signed in");
+      const real = await sendSquadMessage(token, activeSquadSession.id, user.id, trimmed);
+      setSquadMessages((list) => list.map((m) => (m.id === tempId ? real : m)));
+    } catch (e) {
+      setSquadMessages((list) => list.filter((m) => m.id !== tempId));
+      setCloudError("Couldn't send that message — try again.");
     }
   };
 
@@ -7165,6 +7267,9 @@ export default function App() {
           try {
             setSquadSessionMembers(await fetchSessionMembers(token, activeSquadSession.id));
           } catch (e) {}
+        },
+        (newMessage) => {
+          setSquadMessages((list) => (list.some((m) => m.id === newMessage.id) ? list : [...list, newMessage]));
         }
       );
     })();
@@ -7182,12 +7287,18 @@ export default function App() {
       try {
         const token = await getValidToken(authSession, setAuthSession);
         if (!token) return;
-        const [freshSession, freshMembers] = await Promise.all([
+        const [freshSession, freshMembers, freshMessages] = await Promise.all([
           fetchSquadSession(token, activeSquadSession.id),
           fetchSessionMembers(token, activeSquadSession.id),
+          fetchSquadMessages(token, activeSquadSession.id),
         ]);
         if (freshSession) setActiveSquadSession((s) => (s ? { ...s, ...freshSession } : s));
         setSquadSessionMembers(freshMembers);
+        // keep any not-yet-confirmed optimistic sends that haven't landed in the fetch yet
+        setSquadMessages((current) => {
+          const pending = current.filter((m) => String(m.id).startsWith("temp_") && !freshMessages.some((fm) => fm.userId === m.userId && fm.text === m.text));
+          return [...freshMessages, ...pending];
+        });
       } catch (e) {
         // a missed poll is fine — the next one will catch up
       }
@@ -7356,6 +7467,7 @@ export default function App() {
         myId={user.id}
         friends={friends}
         templates={templates}
+        messages={squadMessages}
         onAddToBuild={addToSharedSquadBuild}
         onAddToBurnout={addToSharedSquadBurnout}
         onSetBuildList={setSharedSquadBuildList}
@@ -7369,6 +7481,7 @@ export default function App() {
         onApplyTemplate={applyTemplateToSquadSession}
         onToggleReady={toggleMyReady}
         onPickStation={setMyStation}
+        onSendMessage={sendChatMessage}
       />
     );
   } else if (view === "programs") {
@@ -7428,6 +7541,7 @@ export default function App() {
         onExit={() => setView("home")}
         onSaveSession={saveSession}
         onSquadProgress={reportSquadProgress}
+        onSendPing={sendChatMessage}
       />
     );
   } else if (view === "builder") {
