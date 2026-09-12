@@ -681,7 +681,7 @@ function lastActiveLabel(online, lastSeenAt) {
   return `Active ${Math.floor(hours / 24)}d ago`;
 }
 
-function HomeScreen({ user, history, templates, friends, activeProgramRow, allPrograms, activeSquadSession, onStartBuild, onLoadTemplate, onStartFreestyle, onOpenHistory, onOpenSocial, onOpenPrograms, onStartTodayWorkout, onOpenSquad }) {
+function HomeScreen({ user, history, templates, friends, activeProgramRow, allPrograms, activeSquadSession, pendingSquadInvites, onStartBuild, onLoadTemplate, onStartFreestyle, onOpenHistory, onOpenSocial, onOpenPrograms, onStartTodayWorkout, onOpenSquad }) {
   const firstName = (user?.name || "Casey").split(" ")[0];
   const onlinePartner = (friends || []).find((f) => f.online);
   const recentSessions = (history || []).slice(0, 3).map((s) => ({
@@ -740,10 +740,13 @@ function HomeScreen({ user, history, templates, friends, activeProgramRow, allPr
             onClick={onOpenSocial}
             style={{
               width: 40, height: 40, borderRadius: 10, background: C.bgCard, border: `1px solid ${C.line}`,
-              display: "flex", alignItems: "center", justifyContent: "center",
+              display: "flex", alignItems: "center", justifyContent: "center", position: "relative",
             }}
           >
             <Users size={18} color={C.textLo} />
+            {pendingSquadInvites && pendingSquadInvites.length > 0 && (
+              <span style={{ position: "absolute", top: -3, right: -3, width: 11, height: 11, borderRadius: "50%", background: C.amber, border: `2px solid ${C.bg}` }} />
+            )}
           </button>
           <button
             onClick={onOpenHistory}
@@ -3193,6 +3196,34 @@ function ActiveWorkoutScreen({ buildList, burnoutList, config, squadInfo, onExit
   const [showSquadExpand, setShowSquadExpand] = useState(false);
   const [squadPingSent, setSquadPingSent] = useState(null);
   const [panelChatText, setPanelChatText] = useState("");
+  const [floatingMessages, setFloatingMessages] = useState([]);
+  const seenMessageIdsRef = useRef(null); // null = not yet initialized
+
+  // Detects genuinely NEW messages/pings arriving while you're mid-workout
+  // and briefly floats them on screen — like a live-stream comment feed —
+  // without requiring you to open the Squad panel just to notice them.
+  useEffect(() => {
+    if (!squadMessages) return;
+    if (seenMessageIdsRef.current === null) {
+      // first sight of the message list — mark everything already here as
+      // "seen" so we don't float a burst of old history on mount
+      seenMessageIdsRef.current = new Set(squadMessages.map((m) => m.id));
+      return;
+    }
+    const newOnes = squadMessages.filter((m) => !seenMessageIdsRef.current.has(m.id) && !String(m.id).startsWith("temp_"));
+    squadMessages.forEach((m) => seenMessageIdsRef.current.add(m.id));
+    if (newOnes.length === 0) return;
+    setFloatingMessages((list) => [...list, ...newOnes.map((m) => ({ ...m, fadingOut: false }))]);
+    newOnes.forEach((m) => {
+      setTimeout(() => {
+        setFloatingMessages((list) => list.map((fm) => (fm.id === m.id ? { ...fm, fadingOut: true } : fm)));
+      }, 3200);
+      setTimeout(() => {
+        setFloatingMessages((list) => list.filter((fm) => fm.id !== m.id));
+      }, 3700);
+    });
+  }, [squadMessages]);
+
 
   const phase = timeline[idx];
 
@@ -3541,6 +3572,29 @@ function ActiveWorkoutScreen({ buildList, burnoutList, config, squadInfo, onExit
           onLogSet={(entry) => setSessionLog((l) => [...l, entry])}
           onQueueBurnout={(ex) => setQueuedBurnout((q) => [...q, ex])}
         />
+      )}
+
+      {floatingMessages.length > 0 && (
+        <div style={{ position: "fixed", top: 100, left: 0, right: 0, display: "flex", flexDirection: "column", alignItems: "center", gap: 8, pointerEvents: "none", zIndex: 35, padding: "0 24px" }}>
+          {floatingMessages.map((m) => {
+            const sender = squadInfo?.members?.find((mem) => mem.id === m.userId);
+            return (
+              <div
+                key={m.id}
+                className="fg-fade-in"
+                style={{
+                  background: "rgba(18,18,26,0.88)", border: `1px solid ${C.line}`, borderRadius: 20,
+                  padding: "9px 16px", display: "flex", alignItems: "center", gap: 8, maxWidth: "100%",
+                  opacity: m.fadingOut ? 0 : 1, transition: "opacity 0.5s ease",
+                  backdropFilter: "blur(10px)", boxShadow: "0 6px 20px rgba(0,0,0,0.4)",
+                }}
+              >
+                <span className="fg-display" style={{ color: C.accent, fontSize: 13, fontWeight: 700, flexShrink: 0 }}>{sender?.name || "Member"}</span>
+                <span className="fg-mono" style={{ color: "white", fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{m.text}</span>
+              </div>
+            );
+          })}
+        </div>
       )}
 
       {squadInfo && !showRestLog && (
@@ -7605,6 +7659,7 @@ export default function App() {
         activeProgramRow={activeProgramRow}
         allPrograms={allPrograms}
         activeSquadSession={activeSquadSession}
+        pendingSquadInvites={pendingSquadInvites}
         onStartBuild={startBuilderEmpty}
         onLoadTemplate={loadTemplate}
         onStartFreestyle={() => setView("freestyle")}
