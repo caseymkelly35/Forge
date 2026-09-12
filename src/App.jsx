@@ -643,7 +643,7 @@ function lastActiveLabel(online, lastSeenAt) {
   return `Active ${Math.floor(hours / 24)}d ago`;
 }
 
-function HomeScreen({ user, history, templates, friends, activeProgramRow, allPrograms, onStartBuild, onLoadTemplate, onStartFreestyle, onOpenHistory, onOpenSocial, onOpenPrograms, onStartTodayWorkout }) {
+function HomeScreen({ user, history, templates, friends, activeProgramRow, allPrograms, activeSquadSession, onStartBuild, onLoadTemplate, onStartFreestyle, onOpenHistory, onOpenSocial, onOpenPrograms, onStartTodayWorkout, onOpenSquad }) {
   const firstName = (user?.name || "Casey").split(" ")[0];
   const onlinePartner = (friends || []).find((f) => f.online);
   const recentSessions = (history || []).slice(0, 3).map((s) => ({
@@ -775,6 +775,29 @@ function HomeScreen({ user, history, templates, friends, activeProgramRow, allPr
                 <Play size={14} fill="white" /> Start Today's Workout
               </button>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* active squad session — easy to forget you're in one now that it persists across refreshes */}
+      {activeSquadSession && (
+        <div style={{ padding: "18px 20px 6px" }}>
+          <div
+            onClick={onOpenSquad}
+            className="fg-tap"
+            style={{
+              background: "#8B5CF614", border: "1px solid #8B5CF6", borderRadius: 14,
+              padding: 16, cursor: "pointer", display: "flex", alignItems: "center", gap: 12,
+            }}
+          >
+            <div style={{ width: 40, height: 40, borderRadius: 10, background: "#8B5CF622", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+              <Users size={18} color="#C4B5FD" />
+            </div>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div className="fg-display" style={{ color: C.textHi, fontSize: 16, fontWeight: 600 }}>{activeSquadSession.name}</div>
+              <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, marginTop: 2 }}>You're still in this session · tap to return</div>
+            </div>
+            <ChevronRight size={18} color={C.textLo} />
           </div>
         </div>
       )}
@@ -5163,7 +5186,7 @@ function MemberAvatar({ member, size = 40 }) {
   );
 }
 
-function SocialScreen({ user, history, friends, myInviteCode, pendingSquadInvites, onBack, onSignOut, onStartSquad, onChangeAvatar, onRemoveFriend, onConnectByCode, onAcceptSquadInvite, onDeclineSquadInvite }) {
+function SocialScreen({ user, history, friends, myInviteCode, pendingSquadInvites, onBack, onSignOut, onStartSquad, onChangeAvatar, onRemoveFriend, onConnectByCode, onAcceptSquadInvite, onDeclineSquadInvite, onInviteFriendToLift }) {
   const [groups, setGroups] = useState([]);
   const [copied, setCopied] = useState(false);
   const [invitedToast, setInvitedToast] = useState(null);
@@ -5218,9 +5241,12 @@ function SocialScreen({ user, history, friends, myInviteCode, pendingSquadInvite
     setTimeout(() => setCopied(false), 1600);
   };
 
-  const inviteToLift = (friend) => {
-    setInvitedToast(friend.name);
-    setTimeout(() => setInvitedToast(null), 1800);
+  const inviteToLift = async (friend) => {
+    const ok = await onInviteFriendToLift(friend.id);
+    if (ok) {
+      setInvitedToast(friend.name);
+      setTimeout(() => setInvitedToast(null), 1800);
+    }
   };
 
   const handleConnectByCode = async () => {
@@ -5746,14 +5772,16 @@ function SquadAudioBar({ bpm, onBpmChange, playing, onTogglePlay }) {
 }
 
 function SquadSessionScreen({
-  session, members, myId, friends,
+  session, members, myId, friends, templates,
   onAddToBuild, onAddToBurnout, onSetBuildList, onSetBurnoutList, onUpdateConfig,
-  onInviteFriends, onStartWorkout, onAdvanceMe, onLeaveSession, onBack,
+  onInviteFriends, onStartWorkout, onAdvanceMe, onLeaveSession, onBack, onApplyTemplate,
 }) {
-  const [tab, setTab] = useState("Roster");
+  const [tab, setTab] = useState(() => ((session.buildItems || []).length === 0 ? "Build" : "Roster"));
   const [buildSubTab, setBuildSubTab] = useState("Library");
   const [showInvite, setShowInvite] = useState(null);
   const [selectedIds, setSelectedIds] = useState([]);
+  const [showTemplates, setShowTemplates] = useState(false);
+  const [confirmingLeave, setConfirmingLeave] = useState(false);
   const [previewing, setPreviewing] = useState(false);
   const [doneFlash, setDoneFlash] = useState(false);
   const [bpm, setBpm] = useState(128);
@@ -5801,9 +5829,20 @@ function SquadSessionScreen({
             </div>
           </div>
         </div>
-        <button onClick={onLeaveSession} className="fg-mono" style={{ background: "none", border: `1px solid ${C.line}`, borderRadius: 8, padding: "7px 12px", color: C.textLo, fontSize: 11 }}>
-          Leave
-        </button>
+        {confirmingLeave ? (
+          <div style={{ display: "flex", gap: 6 }}>
+            <button onClick={() => setConfirmingLeave(false)} className="fg-mono" style={{ background: "none", border: `1px solid ${C.line}`, borderRadius: 8, padding: "7px 10px", color: C.textLo, fontSize: 11 }}>
+              Cancel
+            </button>
+            <button onClick={onLeaveSession} className="fg-mono" style={{ background: "#EF4444", border: "none", borderRadius: 8, padding: "7px 10px", color: "white", fontSize: 11 }}>
+              Confirm Leave
+            </button>
+          </div>
+        ) : (
+          <button onClick={() => setConfirmingLeave(true)} className="fg-mono" style={{ background: "none", border: `1px solid ${C.line}`, borderRadius: 8, padding: "7px 12px", color: C.textLo, fontSize: 11 }}>
+            Leave
+          </button>
+        )}
       </div>
 
       <SquadAudioBar bpm={bpm} onBpmChange={setBpm} playing={playing} onTogglePlay={() => setPlaying((p) => !p)} />
@@ -5892,6 +5931,37 @@ function SquadSessionScreen({
           <div className="fg-mono" style={{ color: C.textLo, fontSize: 12, padding: "14px 20px 0", lineHeight: 1.5 }}>
             Anything added here appears live for everyone in this session — this is genuinely shared, not just yours.
           </div>
+
+          {buildItems.length > 0 && (
+            <div style={{ padding: "12px 20px 0" }}>
+              <button
+                onClick={() => setTab("Roster")}
+                className="fg-display"
+                style={{
+                  width: "100%", background: C.blue, border: "none", borderRadius: 10,
+                  padding: "12px", color: "white", fontWeight: 700, fontSize: 14,
+                  display: "flex", alignItems: "center", justifyContent: "center", gap: 7,
+                }}
+              >
+                Done Building ({buildItems.length} exercise{buildItems.length !== 1 ? "s" : ""}) <ArrowRight size={15} />
+              </button>
+            </div>
+          )}
+
+          <div style={{ padding: "12px 20px 0" }}>
+            <button
+              onClick={() => setShowTemplates(true)}
+              className="fg-display"
+              style={{
+                width: "100%", background: "transparent", border: `1px dashed ${C.line}`, borderRadius: 10,
+                padding: "11px", color: C.textHi, fontWeight: 600, fontSize: 13,
+                display: "flex", alignItems: "center", justifyContent: "center", gap: 7,
+              }}
+            >
+              <LayoutList size={14} /> Load a Template Instead
+            </button>
+          </div>
+
           <div style={{ display: "flex", gap: 8, padding: "12px 20px 0" }}>
             {["Library", "Builder"].map((t) => (
               <button
@@ -5970,6 +6040,33 @@ function SquadSessionScreen({
             >
               Send {selectedIds.length > 0 ? `${selectedIds.length} ` : ""}Invite{selectedIds.length !== 1 ? "s" : ""}
             </button>
+          </div>
+        </div>
+      )}
+
+      {showTemplates && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 70, display: "flex", alignItems: "flex-end" }} onClick={() => setShowTemplates(false)}>
+          <div onClick={(e) => e.stopPropagation()} className="fg-sheet-in" style={{ width: "100%", maxHeight: "75vh", overflowY: "auto", background: C.bgRaised, borderTop: `1px solid ${C.line}`, borderRadius: "20px 20px 0 0", padding: 20 }}>
+            <div className="fg-display" style={{ color: C.textHi, fontSize: 20, fontWeight: 700, marginBottom: 6 }}>Load a Template</div>
+            <div className="fg-mono" style={{ color: C.textLo, fontSize: 12, marginBottom: 16, lineHeight: 1.5 }}>
+              This replaces the session's current exercises and settings for everyone — worth a heads up to the group first.
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {(templates || []).map((t) => (
+                <div
+                  key={t.id}
+                  onClick={() => { onApplyTemplate(t); setShowTemplates(false); setBuildSubTab("Builder"); }}
+                  className="fg-tap"
+                  style={{ background: C.bgCard, border: `1px solid ${C.line}`, borderRadius: 10, padding: "12px 14px", display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer" }}
+                >
+                  <div>
+                    <div className="fg-display" style={{ color: C.textHi, fontSize: 15, fontWeight: 600 }}>{t.name}</div>
+                    <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, marginTop: 2 }}>{t.description}</div>
+                  </div>
+                  <ChevronRight size={14} color={C.textLo} />
+                </div>
+              ))}
+            </div>
           </div>
         </div>
       )}
@@ -6486,7 +6583,15 @@ export default function App() {
   const [squadSessionMembers, setSquadSessionMembers] = useState([]);
   const [pendingSquadInvites, setPendingSquadInvites] = useState([]);
 
+  // Skips its very first firing (which happens on every mount, before the
+  // restore logic below even runs) — otherwise this synchronous write races
+  // ahead of that async restore and wipes the saved session before it's read.
+  const skipFirstSquadPersist = useRef(true);
   useEffect(() => {
+    if (skipFirstSquadPersist.current) {
+      skipFirstSquadPersist.current = false;
+      return;
+    }
     storageSet("active-squad-session-id", activeSquadSession?.id || null);
   }, [activeSquadSession?.id]);
 
@@ -6718,6 +6823,28 @@ export default function App() {
     }
   };
 
+  // "Invite to Lift" from a friend's row in Social — genuinely invites them
+  // into a real session now, reusing whichever one's already active (so
+  // inviting several friends in a row lands them all in the same squad)
+  // or starting a fresh one if none exists yet.
+  const inviteFriendToLift = async (friendId) => {
+    try {
+      const token = await getValidToken(authSession, setAuthSession);
+      if (!token) throw new Error("Not signed in");
+      let session = activeSquadSession;
+      if (!session) {
+        session = await createSquadSession(token, authSession.user.id, `${user.name}'s Squad`);
+        setActiveSquadSession(session);
+      }
+      await inviteToSquadSession(token, session.id, [friendId]);
+      setSquadSessionMembers(await fetchSessionMembers(token, session.id));
+      return true;
+    } catch (e) {
+      setCloudError("Couldn't send that invite — try again.");
+      return false;
+    }
+  };
+
   const acceptSquadInvite = async (invitedSession) => {
     try {
       const token = await getValidToken(authSession, setAuthSession);
@@ -6805,6 +6932,12 @@ export default function App() {
   const setSharedSquadBuildList = (newList) => updateSharedSquadBuild({ buildItems: newList });
   const setSharedSquadBurnoutList = (newList) => updateSharedSquadBuild({ burnoutItems: newList });
   const updateSharedSquadConfig = (newConfig) => updateSharedSquadBuild({ config: newConfig });
+
+  const applyTemplateToSquadSession = (template) => {
+    const instantiated = instantiateTemplate(template);
+    updateSharedSquadBuild({ buildItems: instantiated.buildList, burnoutItems: instantiated.burnoutList, config: instantiated.config });
+  };
+
 
   const startRealSquadWorkout = ({ buildList, burnoutList, config }) => {
     setPendingTemplate({ buildList, burnoutList, config });
@@ -7015,6 +7148,7 @@ export default function App() {
         members={squadSessionMembers}
         myId={user.id}
         friends={friends}
+        templates={templates}
         onAddToBuild={addToSharedSquadBuild}
         onAddToBurnout={addToSharedSquadBurnout}
         onSetBuildList={setSharedSquadBuildList}
@@ -7025,6 +7159,7 @@ export default function App() {
         onAdvanceMe={advanceMySquadProgress}
         onLeaveSession={leaveCurrentSquadSession}
         onBack={() => setView("social")}
+        onApplyTemplate={applyTemplateToSquadSession}
       />
     );
   } else if (view === "programs") {
@@ -7058,6 +7193,7 @@ export default function App() {
         onConnectByCode={connectByCode}
         onAcceptSquadInvite={acceptSquadInvite}
         onDeclineSquadInvite={declineSquadInvite}
+        onInviteFriendToLift={inviteFriendToLift}
       />
     );
   } else if (view === "history") {
@@ -7105,6 +7241,7 @@ export default function App() {
         friends={friends}
         activeProgramRow={activeProgramRow}
         allPrograms={allPrograms}
+        activeSquadSession={activeSquadSession}
         onStartBuild={startBuilderEmpty}
         onLoadTemplate={loadTemplate}
         onStartFreestyle={() => setView("freestyle")}
@@ -7112,6 +7249,7 @@ export default function App() {
         onOpenSocial={() => setView("social")}
         onOpenPrograms={() => setView("programs")}
         onStartTodayWorkout={startTodayWorkout}
+        onOpenSquad={() => setView("squad")}
       />
     );
   }
