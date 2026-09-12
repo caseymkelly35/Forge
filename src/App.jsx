@@ -194,6 +194,7 @@ function dbSquadSessionToLocal(row) {
     buildItems: row.build_items || [],
     burnoutItems: row.burnout_items || [],
     status: row.status,
+    roundStartedAt: row.round_started_at,
   };
 }
 
@@ -267,6 +268,7 @@ async function fetchSessionMembers(token, sessionId) {
       startIndex: r.start_index,
       currentIndex: r.current_index,
       completedCount: r.completed_count,
+      isReady: r.is_ready,
     };
   });
 }
@@ -276,7 +278,26 @@ async function updateMemberProgress(token, sessionId, userId, patch) {
   if ("startIndex" in patch) body.start_index = patch.startIndex;
   if ("currentIndex" in patch) body.current_index = patch.currentIndex;
   if ("completedCount" in patch) body.completed_count = patch.completedCount;
+  if ("isReady" in patch) body.is_ready = patch.isReady;
   await supabaseRest(`squad_session_members?session_id=eq.${sessionId}&user_id=eq.${userId}`, { method: "PATCH", token, body });
+}
+
+// Called only by the host (the only one RLS permits to update other
+// members' rows) once everyone's readied up — assigns each joined
+// member their starting station and resets readiness for next time,
+// then stamps the session with a fresh round_started_at so every
+// device gets one unambiguous "a new round just began" signal.
+async function startSquadRound(token, sessionId, assignments) {
+  await Promise.all(
+    assignments.map(({ userId, startIndex }) =>
+      supabaseRest(`squad_session_members?session_id=eq.${sessionId}&user_id=eq.${userId}`, {
+        method: "PATCH",
+        token,
+        body: { start_index: startIndex, current_index: startIndex, is_ready: false },
+      })
+    )
+  );
+  await supabaseRest(`squad_sessions?id=eq.${sessionId}`, { method: "PATCH", token, body: { round_started_at: new Date().toISOString() } });
 }
 
 // Live sync — the one thing plain fetch can't do. Call the returned
@@ -5776,6 +5797,7 @@ function SquadSessionScreen({
   session, members, myId, friends, templates,
   onAddToBuild, onAddToBurnout, onSetBuildList, onSetBurnoutList, onUpdateConfig,
   onInviteFriends, onStartWorkout, onAdvanceMe, onLeaveSession, onBack, onApplyTemplate,
+  onToggleReady, onPickStation,
 }) {
   const [tab, setTab] = useState(() => ((session.buildItems || []).length === 0 ? "Build" : "Roster"));
   const [buildSubTab, setBuildSubTab] = useState("Library");
@@ -5783,10 +5805,13 @@ function SquadSessionScreen({
   const [selectedIds, setSelectedIds] = useState([]);
   const [showTemplates, setShowTemplates] = useState(false);
   const [confirmingLeave, setConfirmingLeave] = useState(false);
-  const [previewing, setPreviewing] = useState(false);
   const [doneFlash, setDoneFlash] = useState(false);
   const [bpm, setBpm] = useState(128);
   const [playing, setPlaying] = useState(false);
+  const [showStarting, setShowStarting] = useState(false);
+  const [countdown, setCountdown] = useState(10);
+  const [pickingStation, setPickingStation] = useState(false);
+  const seenRoundStartRef = useRef(session.roundStartedAt);
 
   const buildItems = session.buildItems || [];
   const burnoutItems = session.burnoutItems || [];
@@ -5794,22 +5819,80 @@ function SquadSessionScreen({
   const n = buildItems.length;
   const me = members.find((m) => m.id === myId);
   const availableFriends = (friends || []).filter((f) => !members.some((m) => m.id === f.id));
+  const joinedMembers = members.filter((m) => m.status === "joined");
+  const allReady = joinedMembers.length > 0 && joinedMembers.every((m) => m.isReady);
+
+  // An unambiguous, explicit signal from the host that a fresh round of
+  // starting positions was just assigned — everyone reacts to this the
+  // same way, whether they're the host or not.
+  useEffect(() => {
+    if (session.roundStartedAt && session.roundStartedAt !== seenRoundStartRef.current) {
+      seenRoundStartRef.current = session.roundStartedAt;
+      setCountdown(10);
+      setShowStarting(true);
+    }
+  }, [session.roundStartedAt]);
+
+  useEffect(() => {
+    if (!showStarting) return;
+    if (countdown <= 0) {
+      const meNow = members.find((m) => m.id === myId);
+      const startAt = meNow ? meNow.currentIndex % Math.max(1, n) : 0;
+      const rotated = n > 0 ? [...buildItems.slice(startAt), ...buildItems.slice(0, startAt)] : [];
+      onStartWorkout({ buildList: rotated, burnoutList: burnoutItems, config });
+      return;
+    }
+    const t = setTimeout(() => setCountdown((c) => c - 1), 1000);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showStarting, countdown]);
 
   const setBuildList = (updater) => onSetBuildList(typeof updater === "function" ? updater(buildItems) : updater);
   const setBurnoutList = (updater) => onSetBurnoutList(typeof updater === "function" ? updater(burnoutItems) : updater);
   const setConfig = (updater) => onUpdateConfig(typeof updater === "function" ? updater(config) : updater);
 
-  if (previewing) {
-    const startAt = me ? me.currentIndex % Math.max(1, n) : 0;
-    const rotated = n > 0 ? [...buildItems.slice(startAt), ...buildItems.slice(0, startAt)] : [];
+  if (showStarting) {
+    const meNow = members.find((m) => m.id === myId);
+    const myStationIdx = meNow ? meNow.currentIndex % Math.max(1, n) : 0;
     return (
-      <WorkoutPreviewScreen
-        buildList={rotated}
-        burnoutList={burnoutItems}
-        config={config}
-        onBack={() => setPreviewing(false)}
-        onConfirm={() => onStartWorkout({ buildList: rotated, burnoutList: burnoutItems, config })}
-      />
+      <div style={{ minHeight: "100vh", background: C.bg, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24 }}>
+        <FontImport />
+        <div className="fg-mono" style={{ color: C.textLo, fontSize: 12, letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 10 }}>
+          Starting in {countdown}
+        </div>
+        <div className="fg-display" style={{ color: C.textHi, fontSize: 32, fontWeight: 700, marginBottom: 8, textAlign: "center" }}>
+          {buildItems[myStationIdx]?.name || "Exercise"}
+        </div>
+        <div className="fg-mono" style={{ color: C.textLo, fontSize: 13, marginBottom: 30 }}>Your starting station</div>
+        <button
+          onClick={() => setPickingStation(true)}
+          className="fg-display"
+          style={{ background: "transparent", border: `1px solid ${C.blue}`, borderRadius: 12, padding: "13px 28px", color: C.accent, fontWeight: 600, fontSize: 15 }}
+        >
+          Pick a Different Station
+        </button>
+
+        {pickingStation && (
+          <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", zIndex: 80, display: "flex", alignItems: "flex-end" }} onClick={() => setPickingStation(false)}>
+            <div onClick={(e) => e.stopPropagation()} className="fg-sheet-in" style={{ width: "100%", maxHeight: "70vh", overflowY: "auto", background: C.bgRaised, borderTop: `1px solid ${C.line}`, borderRadius: "20px 20px 0 0", padding: 20 }}>
+              <div className="fg-display" style={{ color: C.textHi, fontSize: 18, fontWeight: 700, marginBottom: 14 }}>Choose Your Station</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                {buildItems.map((item, i) => (
+                  <div
+                    key={item.uid}
+                    onClick={() => { onPickStation(i); setPickingStation(false); }}
+                    className="fg-tap"
+                    style={{ background: i === myStationIdx ? `${C.blue}22` : C.bgCard, border: `1px solid ${i === myStationIdx ? C.blue : C.line}`, borderRadius: 10, padding: "12px 14px", display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer" }}
+                  >
+                    <span className="fg-display" style={{ color: C.textHi, fontSize: 15, fontWeight: 600 }}>{item.name}</span>
+                    {i === myStationIdx && <Check size={16} color={C.accent} />}
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
     );
   }
 
@@ -5901,29 +5984,52 @@ function SquadSessionScreen({
             <div className="fg-mono" style={{ color: C.textLo, fontSize: 13, textAlign: "center", padding: 30, border: `1px dashed ${C.line}`, borderRadius: 12 }}>
               Tap "Build Together" above to add exercises — everyone in this session will see them appear live.
             </div>
-          ) : me ? (
-            <div style={{ background: `${C.blue}14`, border: `1px solid ${C.blue}`, borderRadius: 14, padding: 16 }}>
-              <div className="fg-mono" style={{ color: C.accent, fontSize: 11, letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: 6 }}>Your Station</div>
-              <div className="fg-display" style={{ color: C.textHi, fontSize: 22, fontWeight: 700, marginBottom: 4 }}>
-                {buildItems[me.currentIndex % n]?.name || "Exercise"}
+          ) : (
+            <>
+              <div style={{ background: allReady ? "#16A34A14" : C.bgCard, border: `1px solid ${allReady ? "#16A34A" : C.line}`, borderRadius: 14, padding: 16, marginBottom: 18 }}>
+                <div className="fg-mono" style={{ color: allReady ? "#4ADE80" : C.textLo, fontSize: 11, letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: 10 }}>
+                  {allReady ? "Everyone's ready — starting..." : "Ready Check"}
+                </div>
+                <div style={{ display: "flex", gap: 8, marginBottom: 14, flexWrap: "wrap" }}>
+                  {joinedMembers.map((m) => (
+                    <div key={m.id} style={{ display: "flex", alignItems: "center", gap: 6, background: C.bg, border: `1px solid ${C.line}`, borderRadius: 20, padding: "5px 10px 5px 5px" }}>
+                      <MemberAvatar member={m} size={22} />
+                      <span className="fg-mono" style={{ color: m.isReady ? "#4ADE80" : C.textLo, fontSize: 11 }}>{m.name.split(" ")[0]}</span>
+                      {m.isReady && <Check size={11} color="#4ADE80" />}
+                    </div>
+                  ))}
+                </div>
+                <button
+                  onClick={onToggleReady}
+                  className="fg-display"
+                  style={{
+                    width: "100%", background: me?.isReady ? "transparent" : "#16A34A",
+                    border: me?.isReady ? `1px solid ${C.line}` : "none", borderRadius: 10, padding: "13px",
+                    color: me?.isReady ? C.textLo : "white", fontWeight: 700, fontSize: 15,
+                  }}
+                >
+                  {me?.isReady ? "Not Ready Yet — Cancel" : "I'm Ready"}
+                </button>
               </div>
-              <div className="fg-mono" style={{ color: C.textLo, fontSize: 12, marginBottom: 14 }}>
-                Round {Math.floor(me.completedCount / n) + 1} · {me.completedCount % n} of {n} stations this round
-              </div>
-              <div style={{ display: "flex", gap: 10 }}>
+
+              <div style={{ background: C.bgCard, border: `1px solid ${C.line}`, borderRadius: 14, padding: 16 }}>
+                <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: 6 }}>Your Last Station</div>
+                <div className="fg-display" style={{ color: C.textHi, fontSize: 18, fontWeight: 700, marginBottom: 4 }}>
+                  {buildItems[me?.currentIndex % n]?.name || "Exercise"}
+                </div>
+                <div className="fg-mono" style={{ color: C.textLo, fontSize: 12, marginBottom: 14 }}>
+                  {me?.completedCount || 0} stations completed
+                </div>
                 <button
                   onClick={() => { onAdvanceMe(); setDoneFlash(true); setTimeout(() => setDoneFlash(false), 1000); }}
                   className="fg-display"
-                  style={{ flex: 1, background: doneFlash ? "#16A34A" : C.blue, border: "none", borderRadius: 10, padding: "13px", color: "white", fontWeight: 700, fontSize: 14, transition: "background 0.2s" }}
+                  style={{ width: "100%", background: doneFlash ? "#16A34A" : "transparent", border: `1px solid ${doneFlash ? "#16A34A" : C.line}`, borderRadius: 10, padding: "12px", color: doneFlash ? "white" : C.textHi, fontWeight: 600, fontSize: 13, transition: "background 0.2s" }}
                 >
-                  {doneFlash ? "Nice work!" : "Done"}
-                </button>
-                <button onClick={() => setPreviewing(true)} className="fg-display" style={{ flex: 1, background: "#16A34A", border: "none", borderRadius: 10, padding: "13px", color: "white", fontWeight: 700, fontSize: 14 }}>
-                  Start Workout
+                  {doneFlash ? "Nice work!" : "Mark a Station Done Manually"}
                 </button>
               </div>
-            </div>
-          ) : null}
+            </>
+          )}
         </div>
       )}
 
@@ -6916,6 +7022,70 @@ export default function App() {
     }
   };
 
+  const toggleMyReady = async () => {
+    if (!activeSquadSession || !user) return;
+    const me = squadSessionMembers.find((m) => m.id === user.id);
+    if (!me) return;
+    const nextReady = !me.isReady;
+    setSquadSessionMembers((list) => list.map((m) => (m.id === user.id ? { ...m, isReady: nextReady } : m))); // optimistic
+    try {
+      const token = await getValidToken(authSession, setAuthSession);
+      if (!token) throw new Error("Not signed in");
+      await updateMemberProgress(token, activeSquadSession.id, user.id, { isReady: nextReady });
+    } catch (e) {
+      setCloudError("Couldn't update — try again.");
+    }
+  };
+
+  const setMyStation = async (index) => {
+    if (!activeSquadSession || !user) return;
+    setSquadSessionMembers((list) => list.map((m) => (m.id === user.id ? { ...m, currentIndex: index } : m))); // optimistic
+    try {
+      const token = await getValidToken(authSession, setAuthSession);
+      if (!token) throw new Error("Not signed in");
+      await updateMemberProgress(token, activeSquadSession.id, user.id, { currentIndex: index });
+    } catch (e) {
+      setCloudError("Couldn't update — try again.");
+    }
+  };
+
+  // Only the host is allowed (by RLS) to update other members' rows, so
+  // only the host's device watches for "everyone's ready" and performs
+  // the actual station assignment. Every other device just watches for
+  // the resulting change and reacts — see the round-started effect below.
+  // Deterministic by sorted user id, so even if this somehow ran more
+  // than once, the result would be identical, not conflicting.
+  const assigningRoundRef = useRef(false);
+  useEffect(() => {
+    if (!activeSquadSession || !user || activeSquadSession.hostId !== user.id) return;
+    const joined = squadSessionMembers.filter((m) => m.status === "joined");
+    const allReady = joined.length > 0 && joined.every((m) => m.isReady);
+    if (!allReady || assigningRoundRef.current) return;
+
+    assigningRoundRef.current = true;
+    const n = Math.max(1, activeSquadSession.buildItems.length);
+    const sorted = [...joined].sort((a, b) => a.id.localeCompare(b.id));
+    const isCircuit = activeSquadSession.config?.rotationMode === "Circuit";
+    const assignments = sorted.map((m, i) => ({
+      userId: m.id,
+      startIndex: isCircuit ? Math.floor((i * n) / sorted.length) : 0,
+    }));
+
+    (async () => {
+      try {
+        const token = await getValidToken(authSession, setAuthSession);
+        if (!token) throw new Error("Not signed in");
+        await startSquadRound(token, activeSquadSession.id, assignments);
+        setSquadSessionMembers(await fetchSessionMembers(token, activeSquadSession.id));
+      } catch (e) {
+        setCloudError("Couldn't start the round — try again.");
+      } finally {
+        assigningRoundRef.current = false;
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [squadSessionMembers, activeSquadSession?.id]);
+
   // add/remove-toggle helpers for the shared Library tab, and raw setters
   // for the shared Builder tab's reordering/superset/config operations —
   // both funnel through updateSharedSquadBuild so every change syncs live
@@ -7166,6 +7336,8 @@ export default function App() {
         onLeaveSession={leaveCurrentSquadSession}
         onBack={() => setView("social")}
         onApplyTemplate={applyTemplateToSquadSession}
+        onToggleReady={toggleMyReady}
+        onPickStation={setMyStation}
       />
     );
   } else if (view === "programs") {
