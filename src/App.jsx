@@ -173,6 +173,21 @@ async function removeFriendship(token, myId, friendId) {
   await supabaseRest(`friendships?user_a=eq.${ua}&user_b=eq.${ub}`, { method: "DELETE", token });
 }
 
+// Real numbers only — the database itself confirms friendship before
+// returning anything, and only ever returns four summary numbers, never
+// any of the friend's individual sessions, exercises, or set details.
+async function fetchFriendStats(token, friendId) {
+  const rows = await supabaseRest("rpc/get_friend_stats", { method: "POST", token, body: { target_user_id: friendId } });
+  const row = rows?.[0];
+  if (!row) return null;
+  return {
+    sessions: row.sessions_count || 0,
+    volume: Math.round(row.total_volume || 0),
+    streak: row.current_streak || 0,
+    prs: row.pr_count || 0,
+  };
+}
+
 async function updateLastSeen(token, userId) {
   await supabaseRest(`profiles?id=eq.${userId}`, { method: "PATCH", token, body: { last_seen_at: new Date().toISOString() } });
 }
@@ -4622,7 +4637,7 @@ function useHistoryData(liveHistory) {
 /* ============================================================
    HISTORY SCREEN
    ============================================================ */
-function HistoryScreen({ liveHistory, onBack, onSaveSession, onUpdateSet, onDeleteSet, onDeleteSession }) {
+function HistoryScreen({ liveHistory, friends, onBack, onSaveSession, onUpdateSet, onDeleteSet, onDeleteSession, onFetchFriendStats }) {
   const [tab, setTab] = useState("Log");
   const [expandedSession, setExpandedSession] = useState(null);
   const [progressExercise, setProgressExercise] = useState(null);
@@ -4630,6 +4645,10 @@ function HistoryScreen({ liveHistory, onBack, onSaveSession, onUpdateSet, onDele
   const [editingSet, setEditingSet] = useState(null); // { sessionId, set }
   const [confirmingDeleteId, setConfirmingDeleteId] = useState(null);
   const [backfilling, setBackfilling] = useState(false);
+  const [vsFriendId, setVsFriendId] = useState(null);
+  const [vsStats, setVsStats] = useState(null);
+  const [vsLoading, setVsLoading] = useState(false);
+  const [vsError, setVsError] = useState(false);
 
   const data = useHistoryData(liveHistory);
   const { sessions, allSets, totalSessions, totalSets, totalVolume, streak, muscleCounts, exerciseNames, prs } = data;
@@ -4701,7 +4720,17 @@ function HistoryScreen({ liveHistory, onBack, onSaveSession, onUpdateSet, onDele
   const maxMuscleCount = Math.max(1, ...Object.values(muscleCounts));
 
   // mock partner comparison
-  const partnerStats = { sessions: Math.round(totalSessions * 0.85) + 2, volume: Math.round(totalVolume * 0.78), streak: Math.max(1, streak - 2), prs: Math.max(1, prs.length - 2) };
+  useEffect(() => {
+    if (!vsFriendId) { setVsStats(null); return; }
+    let cancelled = false;
+    setVsLoading(true);
+    setVsError(false);
+    onFetchFriendStats(vsFriendId)
+      .then((stats) => { if (!cancelled) setVsStats(stats); })
+      .catch(() => { if (!cancelled) setVsError(true); })
+      .finally(() => { if (!cancelled) setVsLoading(false); });
+    return () => { cancelled = true; };
+  }, [vsFriendId]);
 
   const tabs = ["Log", "Progress", "Volume", "PRs", "Heatmap", "VS"];
 
@@ -5000,33 +5029,79 @@ function HistoryScreen({ liveHistory, onBack, onSaveSession, onUpdateSet, onDele
       {/* ===== VS TAB ===== */}
       {tab === "VS" && (
         <div style={{ padding: "18px 20px 0" }}>
-          <div className="fg-mono" style={{ color: C.textLo, fontSize: 12, letterSpacing: "0.1em", textTransform: "uppercase", textAlign: "center", marginBottom: 16 }}>
-            You vs Jess
-          </div>
-          {[
-            ["Sessions", totalSessions, partnerStats.sessions],
-            ["Volume (lbs)", Math.round(totalVolume), partnerStats.volume],
-            ["Streak (days)", streak, partnerStats.streak],
-            ["PRs Set", prs.length, partnerStats.prs],
-          ].map(([label, you, jess]) => {
-            const youAhead = you >= jess;
-            return (
-              <div key={label} style={{ marginBottom: 16 }}>
-                <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, textAlign: "center", marginBottom: 6 }}>{label}</div>
-                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                  <div className="fg-display" style={{ width: 50, textAlign: "right", color: youAhead ? C.accent : C.textHi, fontWeight: 700, fontSize: 18 }}>{you}</div>
-                  <div style={{ flex: 1, display: "flex", height: 8, borderRadius: 4, overflow: "hidden", background: C.bgCard }}>
-                    <div style={{ width: `${(you / (you + jess || 1)) * 100}%`, background: C.blue }} />
-                    <div style={{ width: `${(jess / (you + jess || 1)) * 100}%`, background: "#8B5CF6" }} />
-                  </div>
-                  <div className="fg-display" style={{ width: 50, color: !youAhead ? "#C4B5FD" : C.textHi, fontWeight: 700, fontSize: 18 }}>{jess}</div>
-                </div>
+          {(!friends || friends.length === 0) ? (
+            <div className="fg-mono" style={{ color: C.textLo, fontSize: 13, textAlign: "center", padding: "40px 10px" }}>
+              Add a friend in Social to compare stats with them.
+            </div>
+          ) : (
+            <>
+              <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: 10 }}>
+                Compare against
               </div>
-            );
-          })}
-          <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, textAlign: "center", marginTop: 20 }}>
-            Blue = You · Purple = Jess
-          </div>
+              <div style={{ display: "flex", gap: 8, overflowX: "auto", paddingBottom: 4, marginBottom: 20 }}>
+                {friends.map((f) => (
+                  <div
+                    key={f.id}
+                    onClick={() => setVsFriendId(f.id)}
+                    className="fg-tap"
+                    style={{
+                      flexShrink: 0, display: "flex", alignItems: "center", gap: 7, cursor: "pointer",
+                      background: vsFriendId === f.id ? `${C.blue}22` : C.bgCard,
+                      border: `1px solid ${vsFriendId === f.id ? C.blue : C.line}`,
+                      borderRadius: 20, padding: "6px 12px 6px 6px",
+                    }}
+                  >
+                    <Avatar name={f.name} url={f.avatarUrl} size={24} />
+                    <span className="fg-mono" style={{ color: vsFriendId === f.id ? C.accent : C.textHi, fontSize: 12 }}>{f.name}</span>
+                  </div>
+                ))}
+              </div>
+
+              {!vsFriendId ? (
+                <div className="fg-mono" style={{ color: C.textLo, fontSize: 13, textAlign: "center", padding: "30px 10px" }}>
+                  Pick a friend above to compare.
+                </div>
+              ) : vsLoading ? (
+                <div className="fg-mono" style={{ color: C.textLo, fontSize: 13, textAlign: "center", padding: "30px 10px" }}>
+                  Loading their stats...
+                </div>
+              ) : vsError ? (
+                <div className="fg-mono" style={{ color: C.textLo, fontSize: 13, textAlign: "center", padding: "30px 10px" }}>
+                  Couldn't load their stats — try again.
+                </div>
+              ) : vsStats ? (
+                <>
+                  <div className="fg-mono" style={{ color: C.textLo, fontSize: 12, letterSpacing: "0.1em", textTransform: "uppercase", textAlign: "center", marginBottom: 16 }}>
+                    You vs {friends.find((f) => f.id === vsFriendId)?.name}
+                  </div>
+                  {[
+                    ["Sessions", totalSessions, vsStats.sessions],
+                    ["Volume (lbs)", Math.round(totalVolume), vsStats.volume],
+                    ["Streak (days)", streak, vsStats.streak],
+                    ["Exercises Tried", prs.length, vsStats.prs],
+                  ].map(([label, you, them]) => {
+                    const youAhead = you >= them;
+                    return (
+                      <div key={label} style={{ marginBottom: 16 }}>
+                        <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, textAlign: "center", marginBottom: 6 }}>{label}</div>
+                        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                          <div className="fg-display" style={{ width: 50, textAlign: "right", color: youAhead ? C.accent : C.textHi, fontWeight: 700, fontSize: 18 }}>{you}</div>
+                          <div style={{ flex: 1, display: "flex", height: 8, borderRadius: 4, overflow: "hidden", background: C.bgCard }}>
+                            <div style={{ width: `${(you / (you + them || 1)) * 100}%`, background: C.blue }} />
+                            <div style={{ width: `${(them / (you + them || 1)) * 100}%`, background: "#8B5CF6" }} />
+                          </div>
+                          <div className="fg-display" style={{ width: 50, color: !youAhead ? "#C4B5FD" : C.textHi, fontWeight: 700, fontSize: 18 }}>{them}</div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                  <div className="fg-mono" style={{ color: C.textLo, fontSize: 11, textAlign: "center", marginTop: 20 }}>
+                    Blue = You · Purple = {friends.find((f) => f.id === vsFriendId)?.name}
+                  </div>
+                </>
+              ) : null}
+            </>
+          )}
         </div>
       )}
 
@@ -7089,6 +7164,12 @@ export default function App() {
     }
   };
 
+  const fetchFriendStatsFor = async (friendId) => {
+    const token = await getValidToken(authSession, setAuthSession);
+    if (!token) throw new Error("Not signed in");
+    return fetchFriendStats(token, friendId);
+  };
+
   const startNewSquadSession = async () => {
     try {
       const token = await getValidToken(authSession, setAuthSession);
@@ -7614,11 +7695,13 @@ export default function App() {
     screen = (
       <HistoryScreen
         liveHistory={history}
+        friends={friends}
         onBack={() => setView("home")}
         onSaveSession={saveSession}
         onUpdateSet={updateSet}
         onDeleteSet={deleteSet}
         onDeleteSession={deleteSession}
+        onFetchFriendStats={fetchFriendStatsFor}
       />
     );
   } else if (view === "freestyle") {
