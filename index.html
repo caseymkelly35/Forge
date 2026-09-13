@@ -2,14 +2,31 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <title>FORGE</title>
-    <style>
-      html, body, #root { margin: 0; padding: 0; height: 100%; background: #07070F; }
-    </style>
+
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <meta name="theme-color" content="#07070F" />
+
+    <!-- iOS Safari doesn't fully read the manifest — these are required
+         separately for a proper "Add to Home Screen" experience there. -->
+    <link rel="apple-touch-icon" href="/icon-192.png" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="FORGE" />
   </head>
   <body>
     <div id="root"></div>
     <script type="module" src="/src/main.jsx"></script>
+    <script>
+      if ("serviceWorker" in navigator) {
+        window.addEventListener("load", () => {
+          navigator.serviceWorker.register("/sw.js").catch(() => {
+            // installability/push just won't be available this session — the
+            // rest of the app works completely normally either way
+          });
+        });
+      }
+    </script>
   </body>
 </html>
