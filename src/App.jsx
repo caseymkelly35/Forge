@@ -292,22 +292,16 @@ async function updateMemberProgress(token, sessionId, userId, patch) {
   await supabaseRest(`squad_session_members?session_id=eq.${sessionId}&user_id=eq.${userId}`, { method: "PATCH", token, body });
 }
 
-// Called only by the host (the only one RLS permits to update other
-// members' rows) once everyone's readied up — assigns each joined
-// member their starting station and resets readiness for next time,
-// then stamps the session with a fresh round_started_at so every
-// device gets one unambiguous "a new round just began" signal.
+// Any joined member can call this now (not just the host) — the actual
+// permission check happens inside the database function itself, which
+// runs with elevated privilege specifically so this can't get stuck
+// waiting on one particular person's device being open.
 async function startSquadRound(token, sessionId, assignments) {
-  await Promise.all(
-    assignments.map(({ userId, startIndex }) =>
-      supabaseRest(`squad_session_members?session_id=eq.${sessionId}&user_id=eq.${userId}`, {
-        method: "PATCH",
-        token,
-        body: { start_index: startIndex, current_index: startIndex, is_ready: false },
-      })
-    )
-  );
-  await supabaseRest(`squad_sessions?id=eq.${sessionId}`, { method: "PATCH", token, body: { round_started_at: new Date().toISOString() } });
+  await supabaseRest("rpc/start_squad_round", {
+    method: "POST",
+    token,
+    body: { p_session_id: sessionId, p_assignments: assignments.map((a) => ({ userId: a.userId, startIndex: a.startIndex })) },
+  });
 }
 
 // Live sync — the one thing plain fetch can't do. Call the returned
@@ -7353,15 +7347,18 @@ export default function App() {
     }
   };
 
-  // Only the host is allowed (by RLS) to update other members' rows, so
-  // only the host's device watches for "everyone's ready" and performs
-  // the actual station assignment. Every other device just watches for
-  // the resulting change and reacts — see the round-started effect below.
-  // Deterministic by sorted user id, so even if this somehow ran more
-  // than once, the result would be identical, not conflicting.
+  // Any joined member's device watches for "everyone's ready" and can
+  // trigger the actual station assignment — not just the host's. This
+  // matters: if it were host-only and the host's app wasn't open at the
+  // moment everyone finished readying up, the whole flow would get
+  // permanently stuck with no way to recover. The real permission check
+  // now lives inside start_squad_round itself (a database function), so
+  // any present device can safely do this. Deterministic by sorted user
+  // id, so if more than one device happens to trigger it at once, both
+  // just write the same result — harmless, not conflicting.
   const assigningRoundRef = useRef(false);
   useEffect(() => {
-    if (!activeSquadSession || !user || activeSquadSession.hostId !== user.id) return;
+    if (!activeSquadSession || !user) return;
     const joined = squadSessionMembers.filter((m) => m.status === "joined");
     const allReady = joined.length > 0 && joined.every((m) => m.isReady);
     if (!allReady || assigningRoundRef.current) return;
